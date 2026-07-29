@@ -125,6 +125,10 @@ export class ConformanceRuntime implements PiSessionRuntime {
 		for (const listener of this.listeners) listener({ type: "progress", progress });
 	}
 
+	emitError(error: PiServerError): void {
+		for (const listener of this.listeners) listener({ type: "error", error });
+	}
+
 	private update(updates: Partial<SessionSnapshot>): void {
 		this.stored.snapshot = {
 			...this.stored.snapshot,

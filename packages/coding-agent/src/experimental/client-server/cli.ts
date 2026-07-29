@@ -107,22 +107,22 @@ async function chooseClientOnlySession(
 	args: ExperimentalCliArgs,
 	settingsManager: SettingsManager,
 	model: ModelRef | undefined,
-): Promise<PiSessionClient | undefined> {
+): Promise<{ session?: PiSessionClient; created: boolean }> {
 	const sessions = await client.listSessions();
 	const labels = sessions.map(sessionLabel);
 	const selected = await showStartupSelector(settingsManager, "Select remote session", [
 		{ label: NEW_SESSION_LABEL, value: -1 },
 		...labels.map((label, index) => ({ label, value: index })),
 	]);
-	if (selected === undefined) return undefined;
+	if (selected === undefined) return { created: false };
 	if (selected >= 0) {
 		const summary = sessions[selected];
 		if (!summary) throw new Error("Selected remote session no longer exists");
-		return client.attachSession(summary.id);
+		return { session: await client.attachSession(summary.id), created: false };
 	}
 	const cwd = args.cwd ?? (await promptForRemoteCwd(settingsManager));
-	if (!cwd) return undefined;
-	return client.createSession({ cwd, model, thinkingLevel: args.thinking });
+	if (!cwd) return { created: false };
+	return { session: await client.createSession({ cwd, model, thinkingLevel: args.thinking }), created: true };
 }
 
 async function createController(
@@ -145,8 +145,9 @@ async function createController(
 		});
 		created = true;
 	} else {
-		session = await chooseClientOnlySession(client, args, settingsManager, requestedModel);
-		created = session !== undefined && !snapshot.sessions.some((candidate) => candidate.id === session?.id);
+		const selection = await chooseClientOnlySession(client, args, settingsManager, requestedModel);
+		session = selection.session;
+		created = selection.created;
 	}
 	if (!session) {
 		client.disconnect();

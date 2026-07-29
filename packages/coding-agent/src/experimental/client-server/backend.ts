@@ -92,6 +92,7 @@ export interface ExperimentalPiSessionBackendOptions {
 
 interface AcquiredLock {
 	compromisedError(): Error | undefined;
+	onCompromised(listener: (error: Error) => void): () => void;
 	release(): Promise<void>;
 }
 
@@ -107,20 +108,19 @@ function errorCode(error: unknown): string | undefined {
 		: undefined;
 }
 
-function toPiServerError(error: unknown): PiServerError {
+function toPiServerError(error: unknown): Error {
 	if (error instanceof PiServerError) return error;
 	if (error instanceof AgentHarnessError) {
 		if (error.code === "busy") return new PiServerError("busy", error.message);
+		if (error.code === "invalid_argument") return new PiServerError("invalid_request", error.message);
 		if (error.code === "session" && error.cause instanceof SessionError && error.cause.code === "not_found") {
 			return new PiServerError("not_found", error.message);
 		}
-		return new PiServerError("invalid_request", error.message);
 	}
-	if (error instanceof SessionError) {
-		return new PiServerError(error.code === "not_found" ? "not_found" : "invalid_request", error.message);
+	if (error instanceof SessionError && error.code === "not_found") {
+		return new PiServerError("not_found", error.message);
 	}
-	const message = error instanceof Error ? error.message : String(error);
-	return new PiServerError("invalid_request", message);
+	return error instanceof Error ? error : new Error(String(error));
 }
 
 function parseCreatedAt(value: string): number {
@@ -223,14 +223,17 @@ export class ExperimentalPiSessionBackend implements PiSessionBackend {
 
 	async listSessions(): Promise<SessionSummary[]> {
 		const metadata = await this.repo.list();
-		const summaries = await Promise.all(
-			metadata.map(async (entry): Promise<SessionSummary | undefined> => {
+		return Promise.all(
+			metadata.map(async (entry): Promise<SessionSummary> => {
 				try {
 					const session = await this.repo.open(entry);
 					const branch = await getFullActiveBranch(session);
 					const createdAt = parseCreatedAt(entry.createdAt);
 					const state = readStoredSessionState(branch, createdAt);
-					if (!state.model || state.invalidThinkingLevel !== undefined) return undefined;
+					if (!state.model) throw new Error("stored session has no model");
+					if (state.invalidThinkingLevel !== undefined) {
+						throw new Error(`stored session has invalid thinking level: ${state.invalidThinkingLevel}`);
+					}
 					return {
 						id: entry.id,
 						name: state.name,
@@ -243,12 +246,11 @@ export class ExperimentalPiSessionBackend implements PiSessionBackend {
 						attached: false,
 						locked: await this.isLocked(entry.id),
 					};
-				} catch {
-					return undefined;
+				} catch (error) {
+					throw new Error(`Failed to read experimental session ${entry.id}`, { cause: error });
 				}
 			}),
 		);
-		return summaries.filter((summary): summary is SessionSummary => summary !== undefined);
 	}
 
 	async createSession(options: CreateSessionOptions): Promise<PiSessionRuntime> {
@@ -405,16 +407,13 @@ export class ExperimentalPiSessionBackend implements PiSessionBackend {
 	}
 
 	private async isLocked(sessionId: string): Promise<boolean> {
-		try {
-			return await lockfile.check(await this.ensureLockTarget(sessionId), { realpath: false, stale: 30_000 });
-		} catch {
-			return false;
-		}
+		return lockfile.check(await this.ensureLockTarget(sessionId), { realpath: false, stale: 30_000 });
 	}
 
 	private async acquireLock(sessionId: string): Promise<AcquiredLock> {
 		const target = await this.ensureLockTarget(sessionId);
 		let compromised: Error | undefined;
+		const compromiseListeners = new Set<(error: Error) => void>();
 		let release: (() => Promise<void>) | undefined;
 		try {
 			release = await lockfile.lock(target, {
@@ -424,6 +423,7 @@ export class ExperimentalPiSessionBackend implements PiSessionBackend {
 				retries: 0,
 				onCompromised: (error) => {
 					compromised = error;
+					for (const listener of compromiseListeners) listener(error);
 				},
 			});
 		} catch (error) {
@@ -433,12 +433,33 @@ export class ExperimentalPiSessionBackend implements PiSessionBackend {
 			throw error;
 		}
 		let released = false;
+		let releasing: Promise<void> | undefined;
 		return {
 			compromisedError: () => compromised,
+			onCompromised: (listener) => {
+				compromiseListeners.add(listener);
+				if (compromised) listener(compromised);
+				return () => compromiseListeners.delete(listener);
+			},
 			release: async () => {
 				if (released) return;
-				released = true;
-				await release?.().catch(() => {});
+				if (compromised) {
+					released = true;
+					compromiseListeners.clear();
+					return;
+				}
+				if (releasing) return releasing;
+				const current = (async () => {
+					await release?.();
+					released = true;
+					compromiseListeners.clear();
+				})();
+				releasing = current;
+				try {
+					await current;
+				} finally {
+					if (!released && releasing === current) releasing = undefined;
+				}
 			},
 		};
 	}
@@ -471,13 +492,14 @@ export class ExperimentalPiSessionRuntime implements PiSessionRuntime {
 	private readonly env: NodeExecutionEnv;
 	private readonly acquired: AcquiredLock;
 	private readonly harness: PhasedAgentHarness;
+	private readonly unsubscribeLockCompromise: () => void;
 	private readonly listeners = new Set<(event: PiSessionRuntimeEvent) => void>();
 	private readonly liveItems = new Map<string, TranscriptItem>();
 	private readonly liveOrder: string[] = [];
 	private readonly toolInputs = new Map<string, { toolName: string; input: JsonValue; timestamp: number }>();
 	private unsubscribeHarness: () => void;
 	private revision = 0;
-	private updatedAt = Date.now();
+	private lockCompromise?: Error;
 	private queuedSteerCount = 0;
 	private queuedSteer: ReturnType<typeof normalizeUserMessage>[] = [];
 	private mutationInFlight = false;
@@ -495,6 +517,7 @@ export class ExperimentalPiSessionRuntime implements PiSessionRuntime {
 			createBashTool({
 				commandPrefix: this.settingsManager.getShellCommandPrefix(),
 				prepare: async (execution) => {
+					this.assertUsable();
 					const metadata = await this.session.getMetadata();
 					execution.env.PI_SESSION_ID = metadata.id;
 					if ("path" in metadata && typeof metadata.path === "string")
@@ -520,6 +543,7 @@ export class ExperimentalPiSessionRuntime implements PiSessionRuntime {
 			followUpMode: this.settingsManager.getFollowUpMode(),
 			streamOptions: options.streamOptions,
 			systemPrompt: async () => {
+				this.assertUsable();
 				const metadata = await this.session.getMetadata();
 				const cwd = "cwd" in metadata && typeof metadata.cwd === "string" ? metadata.cwd : this.env.cwd;
 				return buildSystemPrompt({
@@ -546,6 +570,7 @@ export class ExperimentalPiSessionRuntime implements PiSessionRuntime {
 				// Protocol progress is best-effort and must never fail the harness run.
 			}
 		});
+		this.unsubscribeLockCompromise = this.acquired.onCompromised((error) => this.handleLockCompromise(error));
 	}
 
 	getPhase(): SessionPhase {
@@ -567,7 +592,7 @@ export class ExperimentalPiSessionRuntime implements PiSessionRuntime {
 			name: stored.name,
 			cwd: metadata.cwd,
 			createdAt,
-			updatedAt: Math.max(stored.updatedAt, this.updatedAt),
+			updatedAt: stored.updatedAt,
 			phase: this.getPhase(),
 			model: { provider: this.harness.getModel().provider, id: this.harness.getModel().id },
 			thinkingLevel: this.harness.getThinkingLevel(),
@@ -584,7 +609,9 @@ export class ExperimentalPiSessionRuntime implements PiSessionRuntime {
 		this.assertIdle("prompt");
 		try {
 			await this.harness.prompt(input.text);
+			this.throwIfLockCompromised();
 		} catch (error) {
+			this.throwIfLockCompromised();
 			throw toPiServerError(error);
 		}
 	}
@@ -594,7 +621,9 @@ export class ExperimentalPiSessionRuntime implements PiSessionRuntime {
 		if (this.getPhase() !== "turn") throw new PiServerError("busy", "Session is not accepting steering input");
 		try {
 			await this.harness.steer(input.text);
+			this.throwIfLockCompromised();
 		} catch (error) {
+			this.throwIfLockCompromised();
 			throw toPiServerError(error);
 		}
 	}
@@ -603,7 +632,9 @@ export class ExperimentalPiSessionRuntime implements PiSessionRuntime {
 		this.assertUsable();
 		try {
 			await this.harness.abort();
+			this.throwIfLockCompromised();
 		} catch (error) {
+			this.throwIfLockCompromised();
 			throw toPiServerError(error);
 		}
 	}
@@ -648,9 +679,10 @@ export class ExperimentalPiSessionRuntime implements PiSessionRuntime {
 	async dispose(): Promise<void> {
 		if (this.disposePromise) return this.disposePromise;
 		this.disposed = true;
-		this.disposePromise = (async () => {
+		const current = (async () => {
 			try {
 				this.unsubscribeHarness();
+				this.unsubscribeLockCompromise();
 				this.listeners.clear();
 				if (this.harness.getPhase() !== "idle") {
 					await this.harness.abort().catch(() => {});
@@ -661,14 +693,36 @@ export class ExperimentalPiSessionRuntime implements PiSessionRuntime {
 				await this.acquired.release();
 			}
 		})();
-		return this.disposePromise;
+		this.disposePromise = current;
+		try {
+			await current;
+		} catch (error) {
+			if (this.disposePromise === current) this.disposePromise = undefined;
+			throw error;
+		}
 	}
 
 	private assertUsable(): void {
+		this.throwIfLockCompromised();
 		if (this.disposed) throw new PiServerError("invalid_request", "Session runtime is disposed");
-		const compromised = this.acquired.compromisedError();
-		if (compromised)
+	}
+
+	private throwIfLockCompromised(): void {
+		const compromised = this.lockCompromise ?? this.acquired.compromisedError();
+		if (compromised) {
 			throw new PiServerError("session_locked", `Session lock was compromised: ${compromised.message}`);
+		}
+	}
+
+	private handleLockCompromise(error: Error): void {
+		if (this.lockCompromise) return;
+		this.lockCompromise = error;
+		this.mutationInFlight = true;
+		this.harness.terminate(error);
+		this.emit({
+			type: "error",
+			error: new PiServerError("session_locked", `Session lock was compromised: ${error.message}`),
+		});
 	}
 
 	private assertIdle(operation: string): void {
@@ -683,7 +737,9 @@ export class ExperimentalPiSessionRuntime implements PiSessionRuntime {
 		this.mutationInFlight = true;
 		try {
 			await mutation();
+			this.throwIfLockCompromised();
 		} catch (error) {
+			this.throwIfLockCompromised();
 			throw toPiServerError(error);
 		} finally {
 			this.mutationInFlight = false;
@@ -703,7 +759,6 @@ export class ExperimentalPiSessionRuntime implements PiSessionRuntime {
 
 	private touch(): void {
 		this.revision += 1;
-		this.updatedAt = Date.now();
 	}
 
 	private emit(event: PiSessionRuntimeEvent): void {

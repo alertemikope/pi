@@ -73,6 +73,6 @@ The listener rejects paths exceeding the platform's `sockaddr_un` limit, creates
 
 To keep Node's automatic pipe cleanup from unlinking a replacement path, the listener binds an owned private socket inode and exposes the configured path as a hard link. Normal shutdown and stale-start recovery clean both owned links after inode verification.
 
-Top-level options include `maxFrameLength`, `maxPendingBytes`, `handshakeTimeoutMs`, `gracefulCloseTimeoutMs`, `serverId`, and `onError`. Call `await server.close()` for idempotent graceful listener shutdown and runtime disposal.
+Top-level options include `maxFrameLength`, `maxPendingBytes`, `handshakeTimeoutMs`, `gracefulCloseTimeoutMs`, `serverId`, and `onError`. Timeout values must fit Node's timer range of 1 through 2,147,483,647 milliseconds. Call `await server.close()` for idempotent graceful listener shutdown and runtime disposal.
 
 The current server is same-host Unix only. It does not expose an HTTP health endpoint. Supervisors should use socket readiness plus the protocol handshake. There is no standalone server package CLI and no session close/delete protocol operation.

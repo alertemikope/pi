@@ -4,7 +4,7 @@ import type { MaybePromise } from "./types.ts";
 export interface ByteConnection {
 	readonly closed: boolean;
 	send(chunk: Uint8Array): Promise<void>;
-	close(): MaybePromise<void>;
+	close(finalChunk?: Uint8Array): MaybePromise<void>;
 }
 
 export interface ByteConnectionHandler {

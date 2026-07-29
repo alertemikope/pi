@@ -279,7 +279,7 @@ export class PiServerCore {
 				};
 				const live = await this.acquireSession(id, () => this.backend.createSession(options));
 				await this.attach(state, live);
-				const session = await this.broadcastSessionSnapshot(live);
+				const session = this.snapshotForConnection(await this.broadcastSessionSnapshot(live), state);
 				void this.broadcastServerSnapshot();
 				return { command: "create" as const, session };
 			}
@@ -288,7 +288,7 @@ export class PiServerCore {
 					this.backend.openSession(command.sessionId),
 				);
 				await this.attach(state, live);
-				const session = await this.broadcastSessionSnapshot(live);
+				const session = this.snapshotForConnection(await this.broadcastSessionSnapshot(live), state);
 				void this.broadcastServerSnapshot();
 				return { command: "attach" as const, session };
 			}
@@ -302,37 +302,41 @@ export class PiServerCore {
 			}
 			case "prompt": {
 				const live = this.requireAttached(state, command.sessionId);
-				const session = await this.runOperation(live, () => live.runtime.prompt({ text: command.text }));
+				const session = await this.runOperation(state, live, () => live.runtime.prompt({ text: command.text }));
 				return { command: "prompt" as const, session };
 			}
 			case "steer": {
 				const live = this.requireAttached(state, command.sessionId);
-				const session = await this.runOperation(live, () => live.runtime.steer({ text: command.text }));
+				const session = await this.runOperation(state, live, () => live.runtime.steer({ text: command.text }));
 				return { command: "steer" as const, session };
 			}
 			case "abort": {
 				const live = this.requireAttached(state, command.sessionId);
-				const session = await this.runOperation(live, () => live.runtime.abort());
+				const session = await this.runOperation(state, live, () => live.runtime.abort());
 				return { command: "abort" as const, session };
 			}
 			case "set_model": {
 				const live = this.requireAttached(state, command.sessionId);
-				const session = await this.runOperation(live, () => live.runtime.setModel(command.model));
+				const session = await this.runOperation(state, live, () => live.runtime.setModel(command.model));
 				return { command: "set_model" as const, session };
 			}
 			case "set_thinking": {
 				const live = this.requireAttached(state, command.sessionId);
-				const session = await this.runOperation(live, () => live.runtime.setThinking(command.thinkingLevel));
+				const session = await this.runOperation(state, live, () => live.runtime.setThinking(command.thinkingLevel));
 				return { command: "set_thinking" as const, session };
 			}
 		}
 	}
 
-	private async runOperation(live: LiveSession, operation: () => Promise<void>): Promise<SessionSnapshot> {
+	private async runOperation(
+		connection: ConnectionState,
+		live: LiveSession,
+		operation: () => Promise<void>,
+	): Promise<SessionSnapshot> {
 		live.operationCount += 1;
 		try {
 			await operation();
-			return await this.broadcastSessionSnapshot(live);
+			return this.snapshotForConnection(await this.broadcastSessionSnapshot(live), connection);
 		} finally {
 			live.operationCount -= 1;
 			this.scheduleMaybeDispose(live);
@@ -402,6 +406,10 @@ export class PiServerCore {
 	}
 
 	private handleRuntimeEvent(live: LiveSession, event: PiSessionRuntimeEvent): void {
+		if (event.type === "error") {
+			void this.terminateLiveSession(live, event.error).catch((error: unknown) => this.reportError(error));
+			return;
+		}
 		if (event.type === "progress") {
 			const envelope: EventEnvelope = {
 				type: "event",
@@ -412,6 +420,15 @@ export class PiServerCore {
 			void this.broadcastSessionSnapshot(live).catch((error: unknown) => this.reportError(error));
 		}
 		this.scheduleMaybeDispose(live);
+	}
+
+	private async terminateLiveSession(live: LiveSession, error: PiServerError): Promise<void> {
+		this.reportError(error);
+		live.unsubscribe();
+		const connections = [...live.connections];
+		await Promise.all(connections.map((connection) => this.closeConnection(connection.connection)));
+		await Promise.all(connections.map((connection) => this.disconnect(connection)));
+		await this.maybeDispose(live);
 	}
 
 	private async normalizedSnapshot(live: LiveSession): Promise<SessionSnapshot> {
@@ -425,6 +442,10 @@ export class PiServerCore {
 			attached: live.connections.size > 0,
 			locked: true,
 		};
+	}
+
+	private snapshotForConnection(snapshot: SessionSnapshot, connection: ConnectionState): SessionSnapshot {
+		return { ...snapshot, attached: connection.sessionIds.has(snapshot.id) };
 	}
 
 	private async broadcastSessionSnapshot(live: LiveSession): Promise<SessionSnapshot> {
@@ -592,8 +613,13 @@ export class PiServerCore {
 		connection.stage = "closing";
 		clearTimeout(connection.handshakeTimeout);
 		const message: ServerHelloError = { type: "hello_error", error };
-		await this.sendMessage(connection, message);
-		await this.closeConnection(connection.connection);
+		let finalFrame: Uint8Array | undefined;
+		try {
+			finalFrame = encodeServerMessage(message, { maxFrameLength: this.maxFrameLength });
+		} catch (encodeError) {
+			this.reportError(encodeError);
+		}
+		await this.closeConnection(connection.connection, finalFrame);
 		await this.disconnect(connection);
 	}
 
@@ -625,9 +651,9 @@ export class PiServerCore {
 		this.connections.clear();
 	}
 
-	private async closeConnection(connection: ByteConnection): Promise<void> {
+	private async closeConnection(connection: ByteConnection, finalChunk?: Uint8Array): Promise<void> {
 		try {
-			await connection.close();
+			await connection.close(finalChunk);
 		} catch (error) {
 			this.reportError(error);
 		}

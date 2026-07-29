@@ -8,17 +8,31 @@ import type {
 	ToolTranscriptItem,
 	TranscriptItem,
 } from "@earendil-works/pi-protocol";
-import { Container, ProcessTerminal, setKeybindings, Text, TUI } from "@earendil-works/pi-tui";
+import { Container, ProcessTerminal, Spacer, setKeybindings, Text, TUI } from "@earendil-works/pi-tui";
 import { getAgentDir } from "../../config.ts";
 import { KeybindingsManager } from "../../core/keybindings.ts";
 import type { SettingsManager } from "../../core/settings-manager.ts";
 import { AssistantMessageComponent } from "../../modes/interactive/components/assistant-message.ts";
 import { CustomEditor } from "../../modes/interactive/components/custom-editor.ts";
 import { ExtensionSelectorComponent } from "../../modes/interactive/components/extension-selector.ts";
+import { IdleStatus, WorkingStatusIndicator } from "../../modes/interactive/components/status-indicator.ts";
 import { ToolExecutionComponent } from "../../modes/interactive/components/tool-execution.ts";
 import { UserMessageComponent } from "../../modes/interactive/components/user-message.ts";
 import { getEditorTheme, initTheme, stopThemeWatcher, theme } from "../../modes/interactive/theme/theme.ts";
 import type { ExperimentalClientController, ExperimentalClientView } from "./client-controller.ts";
+
+export class DoubleClearAction {
+	private lastTriggeredAt?: number;
+
+	trigger(now = Date.now()): "clear" | "exit" {
+		if (this.lastTriggeredAt !== undefined && now - this.lastTriggeredAt < 500) {
+			this.lastTriggeredAt = undefined;
+			return "exit";
+		}
+		this.lastTriggeredAt = now;
+		return "clear";
+	}
+}
 
 const ZERO_USAGE: Usage = {
 	input: 0,
@@ -93,12 +107,16 @@ export class ExperimentalClientTui {
 	private readonly transcript = new Container();
 	private readonly editor: CustomEditor;
 	private readonly footer = new Text("", 1, 0);
-	private readonly status = new Text("", 1, 0);
+	private readonly status = new Container();
 	private unsubscribeController?: () => void;
 	private unsubscribeConnection?: () => void;
 	private latestView?: ExperimentalClientView;
 	private toolsExpanded = false;
 	private hideThinking: boolean;
+	private readonly doubleClearAction = new DoubleClearAction();
+	private readonly idleStatus = new IdleStatus();
+	private workingStatus?: WorkingStatusIndicator;
+	private statusMessage?: Text;
 	private shuttingDown = false;
 	private finishRun?: () => void;
 
@@ -107,35 +125,41 @@ export class ExperimentalClientTui {
 		this.settingsManager = settingsManager;
 		this.hideThinking = settingsManager.getHideThinkingBlock();
 		initTheme(settingsManager.getTheme(), true);
-		const keybindings = KeybindingsManager.create();
-		setKeybindings(keybindings);
-		this.ui = new TUI(new ProcessTerminal(), settingsManager.getShowHardwareCursor(), getAgentDir());
-		this.ui.setClearOnShrink(settingsManager.getClearOnShrink());
-		this.editor = new CustomEditor(this.ui, getEditorTheme(), keybindings, {
-			paddingX: settingsManager.getEditorPaddingX(),
-			autocompleteMaxVisible: settingsManager.getAutocompleteMaxVisible(),
-		});
-		this.editor.onSubmit = (text) => void this.handleSubmit(text);
-		this.editor.onAction("app.interrupt", () => void this.handleInterrupt());
-		this.editor.onAction("app.clear", () => this.editor.setText(""));
-		this.editor.onAction("app.exit", () => void this.shutdown());
-		this.editor.onAction("app.model.select", () => this.showModelSelector());
-		this.editor.onAction("app.thinking.cycle", () => void this.cycleThinking());
-		this.editor.onAction("app.thinking.toggle", () => {
-			this.hideThinking = !this.hideThinking;
-			this.rebuildTranscript();
-		});
-		this.editor.onAction("app.tools.expand", () => {
-			this.toolsExpanded = !this.toolsExpanded;
-			this.rebuildTranscript();
-		});
-		this.editor.onAction("app.session.new", () => void this.newSession());
-		this.editor.onAction("app.session.resume", () => void this.showResumeSelector());
-		this.ui.addChild(this.transcript);
-		this.ui.addChild(this.status);
-		this.ui.addChild(this.editor);
-		this.ui.addChild(this.footer);
-		this.ui.setFocus(this.editor);
+		try {
+			const keybindings = KeybindingsManager.create();
+			setKeybindings(keybindings);
+			this.ui = new TUI(new ProcessTerminal(), settingsManager.getShowHardwareCursor(), getAgentDir());
+			this.ui.setClearOnShrink(settingsManager.getClearOnShrink());
+			this.editor = new CustomEditor(this.ui, getEditorTheme(), keybindings, {
+				paddingX: settingsManager.getEditorPaddingX(),
+				autocompleteMaxVisible: settingsManager.getAutocompleteMaxVisible(),
+			});
+			this.editor.onSubmit = (text) => void this.handleSubmit(text);
+			this.editor.onAction("app.interrupt", () => void this.handleInterrupt());
+			this.editor.onAction("app.clear", () => this.handleClear());
+			this.editor.onAction("app.exit", () => void this.shutdown());
+			this.editor.onAction("app.model.select", () => this.showModelSelector());
+			this.editor.onAction("app.thinking.cycle", () => void this.cycleThinking());
+			this.editor.onAction("app.thinking.toggle", () => {
+				this.hideThinking = !this.hideThinking;
+				this.rebuildTranscript();
+			});
+			this.editor.onAction("app.tools.expand", () => {
+				this.toolsExpanded = !this.toolsExpanded;
+				this.rebuildTranscript();
+			});
+			this.editor.onAction("app.session.new", () => void this.newSession());
+			this.editor.onAction("app.session.resume", () => void this.showResumeSelector());
+			this.ui.addChild(this.transcript);
+			this.ui.addChild(this.status);
+			this.ui.addChild(new Spacer(1));
+			this.ui.addChild(this.editor);
+			this.ui.addChild(this.footer);
+			this.ui.setFocus(this.editor);
+		} catch (error) {
+			stopThemeWatcher();
+			throw error;
+		}
 	}
 
 	async run(initialPrompt?: string): Promise<void> {
@@ -163,6 +187,7 @@ export class ExperimentalClientTui {
 		this.unsubscribeController = undefined;
 		this.unsubscribeConnection?.();
 		this.unsubscribeConnection = undefined;
+		this.clearWorkingStatus();
 		await this.ui.terminal.drainInput(1000).catch(() => {});
 		this.ui.stop();
 		stopThemeWatcher();
@@ -175,6 +200,7 @@ export class ExperimentalClientTui {
 		this.latestView = view;
 		this.rebuildTranscript();
 		const snapshot = view.snapshot;
+		this.syncWorkingStatus();
 		this.footer.setText(
 			theme.fg(
 				"dim",
@@ -196,6 +222,7 @@ export class ExperimentalClientTui {
 		const renderedToolIds = new Set<string>();
 		for (const item of view.transcript) {
 			if (item.role === "user") {
+				if (this.transcript.children.length > 0) this.transcript.addChild(new Spacer(1));
 				this.transcript.addChild(
 					new UserMessageComponent(userText(item), undefined, this.settingsManager.getOutputPad()),
 				);
@@ -267,6 +294,7 @@ export class ExperimentalClientTui {
 	private async submitPrompt(text: string): Promise<void> {
 		try {
 			this.setStatus("");
+			this.showWorkingStatus();
 			await this.controller.submit(text);
 		} catch (error) {
 			this.showError(error);
@@ -318,6 +346,14 @@ export class ExperimentalClientTui {
 		} catch (error) {
 			this.showError(error);
 		}
+	}
+
+	private handleClear(): void {
+		if (this.doubleClearAction.trigger() === "exit") {
+			void this.shutdown();
+			return;
+		}
+		this.editor.setText("");
 	}
 
 	private async handleInterrupt(): Promise<void> {
@@ -470,8 +506,36 @@ export class ExperimentalClientTui {
 	}
 
 	private setStatus(message: string, error = false): void {
-		this.status.setText(message ? theme.fg(error ? "error" : "muted", message) : "");
+		this.clearWorkingStatus();
+		this.status.clear();
+		this.statusMessage = message ? new Text(theme.fg(error ? "error" : "muted", message), 1, 0) : undefined;
+		if (this.statusMessage) this.status.addChild(this.statusMessage);
+		this.syncWorkingStatus();
 		this.ui.requestRender();
+	}
+
+	private syncWorkingStatus(): void {
+		const shouldShow = this.latestView?.snapshot.phase === "turn" && !this.statusMessage;
+		if (!shouldShow) {
+			this.clearWorkingStatus(true);
+			return;
+		}
+		this.showWorkingStatus();
+	}
+
+	private showWorkingStatus(): void {
+		if (this.workingStatus) return;
+		this.status.clear();
+		this.workingStatus = new WorkingStatusIndicator(this.ui, "Working...");
+		this.status.addChild(this.workingStatus);
+	}
+
+	private clearWorkingStatus(preserveSpace = false): void {
+		if (!this.workingStatus) return;
+		this.workingStatus.dispose();
+		this.status.removeChild(this.workingStatus);
+		this.workingStatus = undefined;
+		if (preserveSpace && this.ui.getClearOnShrink()) this.status.addChild(this.idleStatus);
 	}
 
 	private showError(error: unknown): void {

@@ -207,6 +207,22 @@ describe("validated framed protocol APIs", () => {
 		expect(() => decoder.push(encodeClientMessage(clientHello))).toThrow(/failed/i);
 	});
 
+	test("rejects CBOR byte strings nested in JSON-valued fields", () => {
+		const wire = encodeFrame(
+			encodeCbor({
+				type: "response",
+				id: "request-1",
+				ok: false,
+				error: {
+					code: "invalid_request",
+					message: "invalid",
+					details: { nested: new Uint8Array([1, 2, 3]) },
+				},
+			}),
+		);
+		expect(() => new ServerMessageDecoder().push(wire)).toThrow(ProtocolValidationError);
+	});
+
 	test("rejects truncated and oversized framing through the validated decoder", () => {
 		const truncated = new ServerMessageDecoder();
 		expect(truncated.push(new Uint8Array([0, 0, 0, 2, 1]))).toEqual([]);

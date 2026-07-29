@@ -360,6 +360,37 @@ describe("PiClient", () => {
 		expect(states).toEqual(["connecting", "connected", "disconnected", "connecting", "connected"]);
 	});
 
+	test("supports synchronous reconnect from a disconnection listener", async () => {
+		const first = new MemoryByteServer();
+		const second = new MemoryByteServer();
+		let connection = 0;
+		for (const server of [first, second]) {
+			server.onMessage((message) => {
+				if (message.type !== "hello") return;
+				server.send({
+					type: "hello",
+					version: PROTOCOL_VERSION,
+					connectionId: `connection-${connection}`,
+					snapshot: { ...baseServerSnapshot, revision: connection },
+				});
+			});
+		}
+		const client = new PiClient({
+			token: "bearer-secret",
+			transportFactory: (handlers) => (connection++ === 0 ? first : second).connect(handlers),
+		});
+		await client.connect();
+		let reconnect: Promise<ServerSnapshot> | undefined;
+		client.onConnectionStateChange(({ state }) => {
+			if (state === "disconnected") reconnect = client.reconnect();
+		});
+
+		first.close();
+		expect(reconnect).toBeDefined();
+		await expect(reconnect).resolves.toMatchObject({ revision: 2 });
+		expect(client.connectionState).toBe("connected");
+	});
+
 	test("rejects pending requests on transport errors", async () => {
 		const server = new MemoryByteServer();
 		const client = await connectClient(server);

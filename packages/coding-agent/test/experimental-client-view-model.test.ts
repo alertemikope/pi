@@ -45,6 +45,51 @@ describe("experimental client view model", () => {
 		expect(model.view()?.transcript[0]).toMatchObject({ content: [{ type: "text", text: "saved response" }] });
 	});
 
+	test("applies streamed tool-call argument deltas", () => {
+		const model = new ExperimentalSessionViewModel();
+		model.applySnapshot({
+			...snapshot(1),
+			transcript: [
+				{
+					id: "assistant-1",
+					role: "assistant",
+					content: [{ type: "tool_call", toolCallId: "call-1", toolName: "bash", input: null }],
+					status: "streaming",
+					model: { provider: "faux", id: "faux-1" },
+					timestamp: 1,
+				},
+			],
+		});
+		model.applyProgress({
+			type: "assistant_delta",
+			messageId: "assistant-1",
+			contentIndex: 0,
+			kind: "tool_call",
+			delta: '{"command":',
+		});
+		expect(model.view()?.transcript[0]).toMatchObject({ content: [{ input: '{"command":' }] });
+
+		model.applyProgress({
+			type: "item_updated",
+			item: {
+				id: "assistant-1",
+				role: "assistant",
+				content: [{ type: "tool_call", toolCallId: "call-1", toolName: "bash", input: null }],
+				status: "streaming",
+				model: { provider: "faux", id: "faux-1" },
+				timestamp: 1,
+			},
+		});
+		model.applyProgress({
+			type: "assistant_delta",
+			messageId: "assistant-1",
+			contentIndex: 0,
+			kind: "tool_call",
+			delta: '"pwd"}',
+		});
+		expect(model.view()?.transcript[0]).toMatchObject({ content: [{ input: { command: "pwd" } }] });
+	});
+
 	test("appends transient tool progress and replaces it by id", () => {
 		const model = new ExperimentalSessionViewModel();
 		model.applySnapshot(snapshot(1));

@@ -180,6 +180,7 @@ export class AgentHarness<
 	private runAbortController?: AbortController;
 	private runPromise?: Promise<void>;
 	private pendingSessionWrites: PendingSessionWrite[] = [];
+	private terminalError?: Error;
 	private model: Model<any>;
 	private thinkingLevel: ThinkingLevel;
 	private systemPrompt: AgentHarnessSystemPrompt<TContext, TSkill, TPromptTemplate, TTool> | undefined;
@@ -352,6 +353,7 @@ export class AgentHarness<
 	}
 
 	private async createTurnState(): Promise<AgentHarnessTurnState<TContext, TSkill, TPromptTemplate, TTool>> {
+		if (this.terminalError) throw this.terminalError;
 		const context = await this.session.buildContext();
 		const resources = this.getResources();
 		const sessionMetadata = await this.session.getMetadata();
@@ -510,6 +512,10 @@ export class AgentHarness<
 	}
 
 	private async flushPendingSessionWrites(): Promise<void> {
+		if (this.terminalError) {
+			this.pendingSessionWrites = [];
+			throw this.terminalError;
+		}
 		while (this.pendingSessionWrites.length > 0) {
 			const write = this.pendingSessionWrites[0]!;
 			if (write.type === "message") {
@@ -536,6 +542,7 @@ export class AgentHarness<
 	}
 
 	private async handleAgentEvent(event: AgentEvent, signal?: AbortSignal): Promise<void> {
+		if (this.terminalError) throw this.terminalError;
 		if (event.type === "message_end") {
 			await this.session.appendMessage(event.message);
 			await this.emitAny(event, signal);
@@ -1024,6 +1031,17 @@ export class AgentHarness<
 
 	async setStreamOptions(streamOptions: AgentHarnessStreamOptions): Promise<void> {
 		this.streamOptions = cloneStreamOptions(streamOptions);
+	}
+
+	/** Permanently stop the harness without emitting or persisting failure events. */
+	terminate(error: Error): void {
+		if (this.terminalError) return;
+		this.terminalError = error;
+		this.pendingSessionWrites = [];
+		this.steerQueue = [];
+		this.followUpQueue = [];
+		this.nextTurnQueue = [];
+		this.runAbortController?.abort();
 	}
 
 	async abort(): Promise<AbortResult> {

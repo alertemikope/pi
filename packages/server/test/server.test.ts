@@ -589,6 +589,33 @@ describe("PiServer Unix integration", () => {
 		expect(await prompt).toMatchObject({ ok: true, result: { command: "prompt", session: { phase: "idle" } } });
 	});
 
+	test("returns operation attachment state relative to the requesting connection", async () => {
+		const backend = new MemoryBackend();
+		backend.seed();
+		const { server } = await startServer(backend);
+		const first = await connect(server);
+		const second = await connect(server);
+		await first.hello();
+		await second.hello();
+		await attach(first, "session-1");
+		await attach(second, "session-1");
+
+		const prompt = first.request({ command: "prompt", sessionId: "session-1", text: "hello" });
+		await first.next(
+			(message) =>
+				message.type === "event" &&
+				message.event.type === "session_snapshot" &&
+				message.event.snapshot.phase === "turn",
+		);
+		await first.request({ command: "detach", sessionId: "session-1" });
+		backend.latestRuntime("session-1").finishPrompt();
+
+		expect(await prompt).toMatchObject({
+			ok: true,
+			result: { command: "prompt", session: { id: "session-1", attached: false } },
+		});
+	});
+
 	test("keeps busy work alive after disconnect and disposes when it next becomes idle", async () => {
 		const backend = new MemoryBackend();
 		backend.seed();

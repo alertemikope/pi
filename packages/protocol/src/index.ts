@@ -453,13 +453,27 @@ export class ProtocolValidationError extends Error {
 	}
 }
 
+function isProtocolValue(value: unknown, optionalProperty = false): boolean {
+	if (value === undefined) return optionalProperty;
+	if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") {
+		return true;
+	}
+	if (Array.isArray(value)) return value.every((item) => isProtocolValue(item));
+	if (typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) return false;
+	return Object.values(value).every((item) => isProtocolValue(item, true));
+}
+
 export function parseClientMessage(value: unknown): ClientMessage {
-	if (!Check(ClientMessageSchema, value)) throw new ProtocolValidationError("Invalid client protocol message");
+	if (!Check(ClientMessageSchema, value) || !isProtocolValue(value)) {
+		throw new ProtocolValidationError("Invalid client protocol message");
+	}
 	return value;
 }
 
 export function parseServerMessage(value: unknown): ServerMessage {
-	if (!Check(ServerMessageSchema, value)) throw new ProtocolValidationError("Invalid server protocol message");
+	if (!Check(ServerMessageSchema, value) || !isProtocolValue(value)) {
+		throw new ProtocolValidationError("Invalid server protocol message");
+	}
 	return value;
 }
 

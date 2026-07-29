@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
@@ -7,11 +7,12 @@ import { PiClient } from "@earendil-works/pi-client";
 import { createUnixTransportFactory } from "@earendil-works/pi-client/unix";
 import type { TranscriptProgress } from "@earendil-works/pi-protocol";
 import { PiServer, PiServerError } from "@earendil-works/pi-server";
-import { describe, expect, test } from "vitest";
+import lockfile, { type LockOptions } from "proper-lockfile";
+import { describe, expect, test, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
-import { ExperimentalPiSessionBackend } from "../src/experimental/client-server/backend.ts";
+import { ExperimentalPiSessionBackend, toPiServerError } from "../src/experimental/client-server/backend.ts";
 import { ExperimentalClientController } from "../src/experimental/client-server/client-controller.ts";
 
 async function createFixture() {
@@ -129,8 +130,13 @@ describe("experimental AgentHarness server backend", () => {
 			await runtime.setThinking("high");
 
 			await runtime.dispose();
+			const persistedSummary = (await secondBackend.listSessions()).find(
+				(summary) => summary.id === "server-session-1",
+			);
+			expect(persistedSummary).toBeDefined();
 			runtime = await secondBackend.openSession("server-session-1");
 			const restored = await runtime.snapshot();
+			expect(restored.updatedAt).toBe(persistedSummary?.updatedAt);
 			expect(restored.model).toEqual(initial.model);
 			expect(restored.thinkingLevel).toBe("high");
 			expect(restored.transcript).toEqual(completed.transcript);
@@ -138,6 +144,43 @@ describe("experimental AgentHarness server backend", () => {
 			await runtime.dispose();
 			await rm(fixture.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
 		}
+	});
+
+	test("fails session listing when persisted JSONL is unreadable", async () => {
+		const fixture = await createFixture();
+		const runtime = await fixture.backend.createSession({
+			id: "server-corrupt-session",
+			cwd: fixture.cwd,
+		});
+		await runtime.dispose();
+		const files = await readdir(join(fixture.root, "sessions"), { recursive: true });
+		const sessionFile = files.find((file) => file.endsWith(".jsonl"));
+		if (!sessionFile) throw new Error("Expected persisted JSONL session");
+		await appendFile(join(fixture.root, "sessions", sessionFile), "{invalid json\n");
+
+		try {
+			await expect(fixture.backend.listSessions()).rejects.toThrow(/Failed to read experimental session/);
+		} finally {
+			await rm(fixture.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+		}
+	});
+
+	test("propagates lock status check failures", async () => {
+		const fixture = await createFixture();
+		const runtime = await fixture.backend.createSession({ id: "server-lock-check", cwd: fixture.cwd });
+		await runtime.dispose();
+		const checkSpy = vi.spyOn(lockfile, "check").mockRejectedValue(new Error("lock check failed"));
+		try {
+			await expect(fixture.backend.listSessions()).rejects.toThrow(/Failed to read experimental session/);
+		} finally {
+			checkSpy.mockRestore();
+			await rm(fixture.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+		}
+	});
+
+	test("preserves unexpected operational errors for boundary-safe handling", () => {
+		const operational = new Error("private filesystem detail");
+		expect(toPiServerError(operational)).toBe(operational);
 	});
 
 	test("applies server-only defaults to newly created sessions", async () => {
@@ -154,6 +197,83 @@ describe("experimental AgentHarness server backend", () => {
 			});
 		} finally {
 			await runtime.dispose();
+			await rm(fixture.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+		}
+	});
+
+	test("terminates an active runtime without persisting after its session lock is compromised", async () => {
+		const fixture = await createFixture();
+		const realLock = lockfile.lock.bind(lockfile);
+		let compromise: LockOptions["onCompromised"];
+		let forceRelease: (() => Promise<void>) | undefined;
+		const lockSpy = vi.spyOn(lockfile, "lock").mockImplementation(async (file, options) => {
+			compromise = options?.onCompromised;
+			forceRelease = await realLock(file, options);
+			return forceRelease;
+		});
+		let runtime: Awaited<ReturnType<typeof fixture.backend.createSession>> | undefined;
+		try {
+			runtime = await fixture.backend.createSession({
+				id: "server-compromised-lock",
+				cwd: fixture.cwd,
+				model: { provider: fixture.faux.provider.id, id: "faux-reasoning" },
+			});
+			fixture.faux.setResponses([fauxAssistantMessage("long response ".repeat(1_000))]);
+			let startedResolve: (() => void) | undefined;
+			const started = new Promise<void>((resolvePromise) => {
+				startedResolve = resolvePromise;
+			});
+			runtime.subscribe(() => {
+				if (runtime?.getPhase() === "turn") startedResolve?.();
+			});
+			const prompt = runtime.prompt({ text: "start" });
+			await started;
+			await forceRelease?.();
+			compromise?.(new Error("lock ownership lost"));
+
+			await expect(prompt).rejects.toMatchObject({ code: "session_locked" });
+			await expect(runtime.snapshot()).rejects.toMatchObject({ code: "session_locked" });
+			await runtime.dispose();
+			const secondBackend = await ExperimentalPiSessionBackend.create({
+				defaultCwd: fixture.cwd,
+				sessionRoot: join(fixture.root, "sessions"),
+				modelRuntime: fixture.modelRuntime,
+				settingsManager: fixture.settingsManager,
+			});
+			const reopened = await secondBackend.openSession("server-compromised-lock");
+			try {
+				expect((await reopened.snapshot()).transcript.some((item) => item.role === "assistant")).toBe(false);
+			} finally {
+				await reopened.dispose();
+			}
+		} finally {
+			lockSpy.mockRestore();
+			await runtime?.dispose();
+			await rm(fixture.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+		}
+	});
+
+	test("propagates lock release failure and allows disposal retry", async () => {
+		const fixture = await createFixture();
+		const realLock = lockfile.lock.bind(lockfile);
+		let releaseAttempts = 0;
+		const lockSpy = vi.spyOn(lockfile, "lock").mockImplementation(async (file, options) => {
+			const release = await realLock(file, options);
+			return async () => {
+				releaseAttempts += 1;
+				if (releaseAttempts === 1) throw new Error("release failed");
+				await release();
+			};
+		});
+		let runtime: Awaited<ReturnType<typeof fixture.backend.createSession>> | undefined;
+		try {
+			runtime = await fixture.backend.createSession({ id: "server-release-retry", cwd: fixture.cwd });
+			await expect(runtime.dispose()).rejects.toThrow("release failed");
+			await expect(runtime.dispose()).resolves.toBeUndefined();
+			expect(releaseAttempts).toBe(2);
+		} finally {
+			lockSpy.mockRestore();
+			await runtime?.dispose();
 			await rm(fixture.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
 		}
 	});

@@ -485,16 +485,17 @@ export class PiClient {
 
 	private failConnection(error: Error): void {
 		if (this.stateValue === "disconnected") return;
-		this.setConnectionState("disconnected", error);
+		const reject = this.connectReject;
+		const pending = [...this.pendingRequests.values()];
 		this.transport = undefined;
 		this.decoder = undefined;
-		const reject = this.connectReject;
 		this.connectResolve = undefined;
 		this.connectReject = undefined;
-		reject?.(error);
-		for (const pending of this.pendingRequests.values()) pending.reject(error);
 		this.pendingRequests.clear();
 		this.attachedSessionIds.clear();
+		reject?.(error);
+		for (const request of pending) request.reject(error);
+		this.setConnectionState("disconnected", error);
 	}
 
 	private isCurrentConnection(connectionId: number): boolean {

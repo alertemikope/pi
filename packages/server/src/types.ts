@@ -25,7 +25,10 @@ export interface CreateSessionOptions {
 	thinkingLevel?: ThinkingLevel;
 }
 
-export type PiSessionRuntimeEvent = { type: "snapshot" } | { type: "progress"; progress: TranscriptProgress };
+export type PiSessionRuntimeEvent =
+	| { type: "snapshot" }
+	| { type: "progress"; progress: TranscriptProgress }
+	| { type: "error"; error: PiServerError };
 
 /**
  * One acquired durable session. Implementations must reject conflicting prompt

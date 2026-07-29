@@ -1,12 +1,12 @@
 import { DEFAULT_MAX_FRAME_LENGTH } from "@earendil-works/pi-protocol";
 import { PiServerCore } from "./core.ts";
 import type { PiServerOptions, PiSessionBackend, UnixListenerOptions } from "./types.ts";
-import { UnixListener } from "./unix-listener.ts";
+import { UnixListener, validateUnixSocketPath } from "./unix-listener.ts";
 
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5_000;
 const DEFAULT_GRACEFUL_CLOSE_TIMEOUT_MS = 5_000;
 const MAX_UINT32 = 0xffff_ffff;
-const MAX_UNIX_SOCKET_PATH_BYTES = process.platform === "linux" ? 107 : 103;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 interface ResolvedOptions {
 	unix: UnixListenerOptions;
@@ -111,12 +111,20 @@ function resolveOptions(options: PiServerOptions): ResolvedOptions {
 		throw new TypeError("PiServer maxPendingBytes must be a safe integer at least maxFrameLength + 4");
 	}
 	const handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
-	if (!Number.isSafeInteger(handshakeTimeoutMs) || handshakeTimeoutMs <= 0) {
-		throw new TypeError("PiServer handshakeTimeoutMs must be a positive integer");
+	if (
+		!Number.isSafeInteger(handshakeTimeoutMs) ||
+		handshakeTimeoutMs <= 0 ||
+		handshakeTimeoutMs > MAX_TIMER_DELAY_MS
+	) {
+		throw new TypeError(`PiServer handshakeTimeoutMs must be an integer between 1 and ${MAX_TIMER_DELAY_MS}`);
 	}
 	const gracefulCloseTimeoutMs = options.gracefulCloseTimeoutMs ?? DEFAULT_GRACEFUL_CLOSE_TIMEOUT_MS;
-	if (!Number.isSafeInteger(gracefulCloseTimeoutMs) || gracefulCloseTimeoutMs <= 0) {
-		throw new TypeError("PiServer gracefulCloseTimeoutMs must be a positive integer");
+	if (
+		!Number.isSafeInteger(gracefulCloseTimeoutMs) ||
+		gracefulCloseTimeoutMs <= 0 ||
+		gracefulCloseTimeoutMs > MAX_TIMER_DELAY_MS
+	) {
+		throw new TypeError(`PiServer gracefulCloseTimeoutMs must be an integer between 1 and ${MAX_TIMER_DELAY_MS}`);
 	}
 	validateUnixOptions(options.unix);
 	return {
@@ -130,12 +138,7 @@ function resolveOptions(options: PiServerOptions): ResolvedOptions {
 }
 
 function validateUnixOptions(options: UnixListenerOptions): void {
-	if (!options.path) throw new TypeError("PiServer Unix socket path must not be empty");
-	if (Buffer.byteLength(options.path) > MAX_UNIX_SOCKET_PATH_BYTES) {
-		throw new TypeError(
-			`PiServer Unix socket path is too long; maximum is ${MAX_UNIX_SOCKET_PATH_BYTES} UTF-8 bytes`,
-		);
-	}
+	validateUnixSocketPath(options.path, "PiServer Unix socket path");
 	if (options.mode !== undefined && (!Number.isInteger(options.mode) || options.mode < 0 || options.mode > 0o777)) {
 		throw new TypeError("PiServer Unix socket mode must be an integer between 0 and 0o777");
 	}

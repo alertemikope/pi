@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { encodeClientMessage, encodeFrame, PROTOCOL_VERSION } from "@earendil-works/pi-protocol";
 import { afterEach, describe, expect, test } from "vitest";
-import { PiServer, type PiServerOptions } from "../src/index.ts";
+import { PiServer, PiServerError, type PiServerOptions } from "../src/index.ts";
 import { ConformanceBackend, connectUnix, Deferred, TEST_TOKEN, type WireClient } from "./support.ts";
 
 const servers = new Set<PiServer>();
@@ -223,6 +223,22 @@ describe("Unix transport conformance", () => {
 		await client.close();
 		await secondRuntime.disposed.promise;
 		expect(secondRuntime.disposeCount).toBe(1);
+	});
+
+	test("disconnects attached clients when a runtime reports a terminal error", async () => {
+		const backend = new ConformanceBackend();
+		backend.seed("terminal");
+		const errors: Error[] = [];
+		const { server } = await startServer(backend, { onError: (error) => errors.push(error) });
+		const client = await connect(server);
+		await client.hello();
+		await client.request({ command: "attach", sessionId: "terminal" });
+		const runtime = backend.latestRuntime("terminal");
+
+		runtime.emitError(new PiServerError("session_locked", "lock ownership lost"));
+		await client.waitForClose();
+		await runtime.disposed.promise;
+		expect(errors).toContainEqual(expect.objectContaining({ code: "session_locked" }));
 	});
 
 	test("does not expose unexpected backend errors to clients", async () => {

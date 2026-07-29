@@ -560,6 +560,9 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	if (options?.experimentalRunner) {
+		// Authentication and settings migrations must complete before the server runtime owns credentials.
+		runMigrations(cwd);
+		time("runMigrations");
 		await options.experimentalRunner(args);
 		return;
 	}

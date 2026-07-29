@@ -1,5 +1,6 @@
 import type { PiClient, PiSessionClient, Unsubscribe } from "@earendil-works/pi-client";
 import type {
+	JsonValue,
 	ModelMetadata,
 	ModelRef,
 	ServerEvent,
@@ -16,10 +17,29 @@ export interface ExperimentalClientView {
 	transcript: readonly TranscriptItem[];
 }
 
+function isJsonValue(value: unknown): value is JsonValue {
+	if (value === null || typeof value === "boolean" || typeof value === "string") return true;
+	if (typeof value === "number") return Number.isFinite(value);
+	if (Array.isArray(value)) return value.every(isJsonValue);
+	if (typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) return false;
+	return Object.values(value).every(isJsonValue);
+}
+
+function parsePartialToolInput(value: string): JsonValue {
+	try {
+		const parsed: unknown = JSON.parse(value);
+		if (isJsonValue(parsed)) return parsed;
+	} catch {
+		// Incomplete JSON is expected while tool arguments stream; preserve the raw prefix until it becomes valid.
+	}
+	return value;
+}
+
 export class ExperimentalSessionViewModel {
 	private snapshotValue: SessionSnapshot | undefined;
 	private readonly progressItems = new Map<string, TranscriptItem>();
 	private readonly progressOrder: string[] = [];
+	private readonly toolCallBuffers = new Map<string, string>();
 
 	get snapshot(): SessionSnapshot | undefined {
 		return this.snapshotValue;
@@ -29,6 +49,7 @@ export class ExperimentalSessionViewModel {
 		this.snapshotValue = undefined;
 		this.progressItems.clear();
 		this.progressOrder.length = 0;
+		this.toolCallBuffers.clear();
 		this.applySnapshot(snapshot);
 	}
 
@@ -39,6 +60,7 @@ export class ExperimentalSessionViewModel {
 		this.snapshotValue = structuredClone(snapshot);
 		this.progressItems.clear();
 		this.progressOrder.length = 0;
+		this.toolCallBuffers.clear();
 	}
 
 	applyProgress(progress: TranscriptProgress): void {
@@ -46,7 +68,14 @@ export class ExperimentalSessionViewModel {
 			this.setProgressItem(progress.item);
 			return;
 		}
-		if (progress.type === "item_updated" || progress.type === "item_finished") {
+		if (progress.type === "item_updated") {
+			this.setProgressItem(progress.item);
+			return;
+		}
+		if (progress.type === "item_finished") {
+			for (const key of this.toolCallBuffers.keys()) {
+				if (key.startsWith(`${progress.item.id}:`)) this.toolCallBuffers.delete(key);
+			}
 			this.setProgressItem(progress.item);
 			return;
 		}
@@ -57,6 +86,12 @@ export class ExperimentalSessionViewModel {
 			if (progress.kind === "text" && part.type === "text") return { ...part, text: part.text + progress.delta };
 			if (progress.kind === "thinking" && part.type === "thinking") {
 				return { ...part, thinking: part.thinking + progress.delta };
+			}
+			if (progress.kind === "tool_call" && part.type === "tool_call") {
+				const key = `${progress.messageId}:${progress.contentIndex}`;
+				const buffer = (this.toolCallBuffers.get(key) ?? "") + progress.delta;
+				this.toolCallBuffers.set(key, buffer);
+				return { ...part, input: parsePartialToolInput(buffer) };
 			}
 			return structuredClone(part);
 		});

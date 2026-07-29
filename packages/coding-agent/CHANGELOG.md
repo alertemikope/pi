@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added an experimental `PI_EXPERIMENTAL=1` client/server CLI with durable server-owned sessions, authenticated Unix socket transport, and a remote-session TUI.
+- Added an experimental `PI_EXPERIMENTAL=1` client/server CLI with durable server-owned sessions, authenticated Unix socket transport, and a remote-session TUI with legacy message spacing, working activity, and double-Ctrl+C exit behavior.
 
 ### Fixed
 

@@ -8,6 +8,14 @@ import type { UnixListenerOptions } from "./types.ts";
 
 const DEFAULT_SOCKET_MODE = 0o600;
 const SOCKET_PROBE_TIMEOUT_MS = 1_000;
+const MAX_UNIX_SOCKET_PATH_BYTES = process.platform === "linux" ? 107 : 103;
+
+export function validateUnixSocketPath(path: string, description = "Unix socket path"): void {
+	if (!path) throw new TypeError(`${description} must not be empty`);
+	if (Buffer.byteLength(path) > MAX_UNIX_SOCKET_PATH_BYTES) {
+		throw new TypeError(`${description} is too long; maximum is ${MAX_UNIX_SOCKET_PATH_BYTES} UTF-8 bytes`);
+	}
+}
 
 interface ListenerOptions {
 	listener: UnixListenerOptions;
@@ -47,9 +55,10 @@ export class UnixListener {
 		if (this.server) throw new Error("Unix listener is already started");
 		if (this.closing) throw new Error("Unix listener is closing or closed");
 
+		const ownedBindPath = getOwnedBindPath(this.path);
+		validateUnixSocketPath(ownedBindPath, "PiServer private Unix bind path");
 		await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
 		await removeStaleSocket(this.path);
-		const ownedBindPath = getOwnedBindPath(this.path);
 		await removeStaleSocket(ownedBindPath);
 		this.ownedBindPath = ownedBindPath;
 		const server = createServer((socket) => this.acceptSocket(socket));
@@ -218,13 +227,18 @@ class UnixByteConnection implements ByteConnection {
 		return tracked;
 	}
 
-	close(): Promise<void> {
+	close(finalChunk?: Uint8Array): Promise<void> {
 		if (this.closedValue || this.socket.destroyed) {
 			this.markClosed();
 			return Promise.resolve();
 		}
 		if (this.closePromise) return this.closePromise;
 		this.closing = true;
+		if (finalChunk && (this.pendingBytes > 0 || this.socket.writableLength > 0)) {
+			this.socket.destroy();
+			this.markClosed();
+			return Promise.resolve();
+		}
 		this.closePromise = new Promise<void>((resolve) => {
 			this.resolveClose = resolve;
 			const timer = setTimeout(() => {
@@ -234,7 +248,8 @@ class UnixByteConnection implements ByteConnection {
 			timer.unref();
 			this.socket.once("close", () => clearTimeout(timer));
 			try {
-				this.socket.end();
+				if (finalChunk) this.socket.end(finalChunk);
+				else this.socket.end();
 			} catch {
 				this.socket.destroy();
 			}
