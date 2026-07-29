@@ -1,4 +1,6 @@
 import { createAssistantMessageEventStream, Type } from "@earendil-works/pi-ai";
+import { PiClient } from "@earendil-works/pi-client";
+import { PROTOCOL_VERSION } from "@earendil-works/pi-protocol";
 import { complete, getModel, getProviders, streamSimple } from "@earendil-works/pi-ai/compat";
 import {
 	Agent,
@@ -57,5 +59,7 @@ console.log(
 	truncateHead("a\nb", { maxLines: 1 }).content,
 	new FileError("not_found", "missing").code,
 	toError("boom").message,
+	typeof PiClient,
+	PROTOCOL_VERSION,
 	typeof streamProxy,
 );

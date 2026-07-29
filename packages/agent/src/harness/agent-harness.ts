@@ -881,6 +881,10 @@ export class AgentHarness<
 		}
 	}
 
+	getPhase(): AgentHarnessPhase {
+		return this.phase;
+	}
+
 	getModel(): Model<any> {
 		return this.model;
 	}

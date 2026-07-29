@@ -516,6 +516,7 @@ async function promptForMissingSessionCwd(
 
 export interface MainOptions {
 	extensionFactories?: InlineExtension[];
+	experimentalRunner?: (args: string[]) => Promise<void>;
 }
 
 export async function main(args: string[], options?: MainOptions) {
@@ -555,6 +556,11 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	if (await runCredentialPrintCommand(args)) {
+		return;
+	}
+
+	if (options?.experimentalRunner) {
+		await options.experimentalRunner(args);
 		return;
 	}
 

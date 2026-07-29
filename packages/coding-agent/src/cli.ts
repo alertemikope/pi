@@ -6,7 +6,9 @@
  * Test with: npx tsx src/cli-new.ts [args...]
  */
 import { APP_NAME } from "./config.ts";
+import { areExperimentalFeaturesEnabled } from "./core/experimental.ts";
 import { configureHttpDispatcher } from "./core/http-dispatcher.ts";
+import { runExperimentalClientServerCli } from "./experimental/client-server/cli.ts";
 import { main } from "./main.ts";
 
 process.title = APP_NAME;
@@ -17,4 +19,7 @@ process.emitWarning = (() => {}) as typeof process.emitWarning;
 // Runtime settings are applied once SettingsManager has loaded global/project settings.
 configureHttpDispatcher();
 
-main(process.argv.slice(2));
+main(
+	process.argv.slice(2),
+	areExperimentalFeaturesEnabled() ? { experimentalRunner: runExperimentalClientServerCli } : undefined,
+);

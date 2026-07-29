@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added an experimental `PI_EXPERIMENTAL=1` client/server CLI with durable server-owned sessions, authenticated Unix socket transport, and a remote-session TUI.
+
 ### Fixed
 
 - Added a status line when the tool output expansion is toggled ([#7180](https://github.com/earendil-works/pi/issues/7180)).

@@ -29,6 +29,9 @@ To learn more about Pi:
 |---------|-------------|
 | **[@earendil-works/pi-ai](packages/ai)** | Unified multi-provider LLM API (OpenAI, Anthropic, Google, etc.) |
 | **[@earendil-works/pi-agent-core](packages/agent)** | Agent runtime with tool calling and state management |
+| **[@earendil-works/pi-protocol](packages/protocol)** | Runtime-neutral protocol schemas for Pi clients and servers |
+| **[@earendil-works/pi-client](packages/client)** | Transport-neutral client for remote Pi sessions |
+| **[@earendil-works/pi-server](packages/server)** | Unix socket server for durable remote Pi sessions |
 | **[@earendil-works/pi-coding-agent](packages/coding-agent)** | Interactive coding agent CLI |
 | **[@earendil-works/pi-tui](packages/tui)** | Terminal UI library with differential rendering |
 

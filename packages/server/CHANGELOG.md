@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Replaced the experimental child-process supervisor and `server` CLI with a Unix-socket `PiServer` API over the transport-neutral framed CBOR protocol.
+
+### Added
+
+- Added an authenticated Unix-domain listener for shared durable sessions, with backend/runtime injection, bounded framing, stale-socket safety, restrictive permissions, and graceful shutdown.
+
 ## [0.82.1] - 2026-07-25
 
 ## [0.82.0] - 2026-07-24

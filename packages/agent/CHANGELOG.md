@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `AgentHarness.getPhase()` for observing the current lifecycle phase.
+
 ## [0.82.1] - 2026-07-25
 
 ## [0.82.0] - 2026-07-24

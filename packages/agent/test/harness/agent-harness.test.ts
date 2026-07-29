@@ -102,6 +102,7 @@ describe("AgentHarness", () => {
 			steeringMode: "all",
 			followUpMode: "all",
 		});
+		expect(harness.getPhase()).toBe("idle");
 		expect(harness.getModel()).toBe(initialModel);
 		expect(harness.getThinkingLevel()).toBe("high");
 		expect(harness.getSteeringMode()).toBe("all");
