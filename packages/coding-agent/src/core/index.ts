@@ -27,6 +27,20 @@ export {
 } from "./agent-session-services.ts";
 export { type BashExecutorOptions, type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 export type { CompactionResult } from "./compaction/index.ts";
+export {
+	acquireDurableOperationLease,
+	type DurableEffectClaim,
+	type DurableEffectSnapshot,
+	type DurableEffectStatus,
+	type DurableOperationHandle,
+	DurableOperationJournal,
+	type DurableOperationLease,
+	type DurableOperationOutcome,
+	type DurableOperationSnapshot,
+	type DurableOperationStatus,
+	type DurablePreparedInput,
+	type DurableReplayPolicy,
+} from "./durable-operations.ts";
 export { createEventBus, type EventBus, type EventBusController } from "./event-bus.ts";
 export { areExperimentalFeaturesEnabled } from "./experimental.ts";
 // Extensions system

@@ -1,8 +1,18 @@
 import { constants as bufferConstants } from "buffer";
-import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "fs";
+import {
+	appendFileSync,
+	closeSync,
+	existsSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+	writeSync,
+} from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { findMostRecentSession, loadEntriesFromFile, SessionManager } from "../../src/core/session-manager.ts";
 
 const HEADER_SCAN_LIMIT_BYTES = 1024 * 1024;
@@ -184,6 +194,16 @@ describe("findMostRecentSession", () => {
 		expect(findMostRecentSession(tempDir)).toBe(file);
 	});
 
+	it("ignores durable operation sidecars even when they contain a session-like header", async () => {
+		const sessionFile = join(tempDir, "session.jsonl");
+		const sidecarFile = `${sessionFile}.operations.jsonl`;
+		writeFileSync(sessionFile, '{"type":"session","id":"session","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n');
+		await new Promise((r) => setTimeout(r, 10));
+		writeFileSync(sidecarFile, '{"type":"session","id":"sidecar","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n');
+
+		expect(findMostRecentSession(tempDir)).toBe(sessionFile);
+	});
+
 	it("returns most recently modified session", async () => {
 		const file1 = join(tempDir, "older.jsonl");
 		const file2 = join(tempDir, "newer.jsonl");
@@ -251,6 +271,7 @@ describe("SessionManager custom flat session directory", () => {
 	});
 
 	afterEach(() => {
+		vi.restoreAllMocks();
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
@@ -285,6 +306,15 @@ describe("SessionManager custom flat session directory", () => {
 		const sessionA = createPersistedSession(projectA, "from A");
 		await new Promise((r) => setTimeout(r, 10));
 		const sessionB = createPersistedSession(projectB, "from B");
+		writeFileSync(
+			`${sessionA}.operations.jsonl`,
+			`${JSON.stringify({
+				type: "session",
+				id: "durable-sidecar",
+				timestamp: "2025-01-01T00:00:00Z",
+				cwd: projectA,
+			})}\n`,
+		);
 
 		const currentA = await SessionManager.list(projectA, tempDir);
 		expect(currentA.map((session) => session.path)).toEqual([sessionA]);
@@ -294,6 +324,103 @@ describe("SessionManager custom flat session directory", () => {
 
 		const continuedA = SessionManager.continueRecent(projectA, tempDir);
 		expect(continuedA.getSessionFile()).toBe(sessionA);
+	});
+
+	it("creates a new session when the discovered recent session disappears before opening", () => {
+		const staleSession = createPersistedSession(projectA, "disappearing");
+		const openExisting = SessionManager.openExisting.bind(SessionManager);
+		const openSpy = vi
+			.spyOn(SessionManager, "openExisting")
+			.mockImplementationOnce((path, sessionDir, cwdOverride) => {
+				rmSync(path);
+				return openExisting(path, sessionDir, cwdOverride);
+			});
+
+		const continued = SessionManager.continueRecent(projectA, tempDir);
+
+		expect(openSpy).toHaveBeenCalledWith(staleSession, tempDir, projectA);
+		expect(continued.getSessionFile()).not.toBe(staleSession);
+		expect(existsSync(staleSession)).toBe(false);
+		expect(continued.getEntries()).toEqual([]);
+	});
+});
+
+describe("SessionManager.importFromJsonl", () => {
+	let tempDir: string;
+	let sessionDir: string;
+	let sourceDir: string;
+
+	beforeEach(() => {
+		tempDir = join(tmpdir(), `session-import-${Date.now()}`);
+		sessionDir = join(tempDir, "sessions");
+		sourceDir = join(tempDir, "external");
+		mkdirSync(sessionDir, { recursive: true });
+		mkdirSync(sourceDir, { recursive: true });
+	});
+
+	afterEach(() => {
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	function writeImportSource(path: string, id: string): void {
+		writeFileSync(
+			path,
+			`${JSON.stringify({
+				type: "session",
+				version: 3,
+				id,
+				timestamp: "2025-01-01T00:00:00Z",
+				cwd: tempDir,
+			})}\n`,
+		);
+	}
+
+	it("keeps the imported target unpublished until durable initialization", () => {
+		const source = join(sourceDir, "imported.jsonl");
+		writeImportSource(source, "imported-session");
+
+		const imported = SessionManager.importFromJsonl(source, sessionDir);
+		const target = imported.getSessionFile();
+		if (!target) throw new Error("missing import target");
+
+		expect(target).toBe(join(sessionDir, "imported.jsonl"));
+		expect(existsSync(target)).toBe(false);
+		imported.assertDurableSourceUnchanged();
+		imported.ensurePersisted();
+		expect(existsSync(target)).toBe(true);
+		expect(SessionManager.openExisting(target).getSessionId()).toBe("imported-session");
+	});
+
+	it("chooses a unique target instead of overwriting a colliding basename", () => {
+		const source = join(sourceDir, "collision.jsonl");
+		const existing = join(sessionDir, "collision.jsonl");
+		writeImportSource(source, "imported-session");
+		writeImportSource(existing, "existing-session");
+		const existingBytes = readFileSync(existing);
+
+		const imported = SessionManager.importFromJsonl(source, sessionDir);
+		const target = imported.getSessionFile();
+		if (!target) throw new Error("missing import target");
+
+		expect(target).not.toBe(existing);
+		expect(existsSync(target)).toBe(false);
+		imported.ensurePersisted();
+		expect(readFileSync(existing)).toEqual(existingBytes);
+		expect(SessionManager.openExisting(target).getSessionId()).toBe("imported-session");
+	});
+
+	it("refuses to publish when the selected target appears before lease validation", () => {
+		const source = join(sourceDir, "raced.jsonl");
+		writeImportSource(source, "imported-session");
+		const imported = SessionManager.importFromJsonl(source, sessionDir);
+		const target = imported.getSessionFile();
+		if (!target) throw new Error("missing import target");
+		writeImportSource(target, "racing-session");
+
+		expect(() => imported.assertDurableSourceUnchanged()).toThrow(
+			`Session target appeared before durable initialization: ${target}`,
+		);
+		expect(SessionManager.openExisting(target).getSessionId()).toBe("racing-session");
 	});
 });
 
@@ -309,7 +436,69 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	it("truncates and rewrites empty file with valid header", () => {
+	it("refuses to open a missing session in strict mode without creating it", () => {
+		const missingFile = join(tempDir, "missing.jsonl");
+
+		expect(() => SessionManager.openExisting(missingFile, tempDir)).toThrow(
+			`Session file does not exist: ${missingFile}`,
+		);
+		expect(existsSync(missingFile)).toBe(false);
+	});
+
+	it("opens a legacy transcript read-only and refuses to recreate it after deletion", () => {
+		const legacyFile = join(tempDir, "legacy.jsonl");
+		const original = `${JSON.stringify({
+			type: "session",
+			version: 2,
+			id: "legacy-session",
+			timestamp: "2025-01-01T00:00:00Z",
+			cwd: tempDir,
+		})}\n`;
+		writeFileSync(legacyFile, original);
+
+		const sm = SessionManager.open(legacyFile, tempDir);
+		expect(sm.getHeader()?.version).toBe(3);
+		expect(readFileSync(legacyFile, "utf8")).toBe(original);
+
+		rmSync(legacyFile);
+		expect(() => sm.assertDurableSourceUnchanged()).toThrow(/changed or was deleted/);
+		expect(() => readFileSync(legacyFile, "utf8")).toThrow();
+	});
+
+	it("reloads concurrent transcript appends under the durable lease before migration", () => {
+		const legacyFile = join(tempDir, "legacy-concurrent.jsonl");
+		writeFileSync(
+			legacyFile,
+			`${JSON.stringify({
+				type: "session",
+				version: 2,
+				id: "legacy-concurrent",
+				timestamp: "2025-01-01T00:00:00Z",
+				cwd: tempDir,
+			})}\n`,
+		);
+
+		const sm = SessionManager.open(legacyFile, tempDir);
+		appendFileSync(
+			legacyFile,
+			`${JSON.stringify({
+				type: "message",
+				id: "concurrent",
+				parentId: null,
+				timestamp: "2025-01-01T00:00:01Z",
+				message: { role: "user", content: "concurrent append", timestamp: 1 },
+			})}\n`,
+		);
+
+		sm.assertDurableSourceUnchanged();
+		sm.ensurePersisted();
+
+		expect(sm.getEntry("concurrent")).toBeDefined();
+		expect(readFileSync(legacyFile, "utf8")).toContain('"id":"concurrent"');
+		expect(readFileSync(legacyFile, "utf8")).toContain('"version":3');
+	});
+
+	it("defers rewriting an empty file until durable initialization", () => {
 		const emptyFile = join(tempDir, "empty.jsonl");
 		writeFileSync(emptyFile, "");
 
@@ -320,7 +509,12 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 		expect(sm.getHeader()).toBeTruthy();
 		expect(sm.getHeader()?.type).toBe("session");
 
-		// File should now contain a valid header
+		// Opening is read-only so deletion cannot race a pre-lease rewrite.
+		expect(readFileSync(emptyFile, "utf-8")).toBe("");
+		sm.assertDurableSourceUnchanged();
+		sm.ensurePersisted();
+
+		// Durable initialization materializes the valid header.
 		const content = readFileSync(emptyFile, "utf-8");
 		const lines = content.trim().split("\n").filter(Boolean);
 		expect(lines.length).toBe(1);
@@ -368,6 +562,8 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 
 		const sm1 = SessionManager.open(emptyFile, tempDir);
 		const sessionId = sm1.getSessionId();
+		sm1.assertDurableSourceUnchanged();
+		sm1.ensurePersisted();
 
 		const sm2 = SessionManager.open(emptyFile, tempDir);
 		expect(sm2.getSessionId()).toBe(sessionId);

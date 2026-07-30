@@ -594,4 +594,25 @@ describe("createBranchedSession", () => {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
+
+	it("can defer a branched transcript until the target lease is acquired", () => {
+		const tempDir = join(tmpdir(), `session-fork-deferred-${Date.now()}`);
+		mkdirSync(tempDir, { recursive: true });
+
+		try {
+			const session = SessionManager.create(tempDir, tempDir);
+			session.appendMessage(userMsg("first question"));
+			const assistantId = session.appendMessage(assistantMsg("first answer"));
+
+			const newFile = session.createBranchedSession(assistantId, { deferPersistence: true });
+			expect(newFile).toBeDefined();
+			expect(existsSync(newFile!)).toBe(false);
+
+			session.assertDurableSourceUnchanged();
+			session.ensurePersisted();
+			expect(existsSync(newFile!)).toBe(true);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
 });

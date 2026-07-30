@@ -1,8 +1,9 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setKeybindings } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { DurableOperationJournal } from "../src/core/durable-operations.ts";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type { SessionInfo } from "../src/core/session-manager.ts";
 import { SessionSelectorComponent } from "../src/modes/interactive/components/session-selector.ts";
@@ -350,5 +351,121 @@ describe("session selector path/delete interactions", () => {
 
 		expect(confirmationChanges).toEqual([]);
 		expect(errorMessage).toBe("Cannot delete the currently active session");
+	});
+
+	it("deletes the exact durable operation sidecar with the session", async () => {
+		const baseDir = mkdtempSync(join(tmpdir(), "pi-session-selector-delete-"));
+		tempDirs.push(baseDir);
+		const sessionPath = join(baseDir, "session.jsonl");
+		const sidecarPath = `${sessionPath}.operations.jsonl`;
+		writeFileSync(sessionPath, "session\n");
+		writeFileSync(sidecarPath, "durable operations\n");
+		const sessions = [makeSession({ id: "session", path: sessionPath })];
+
+		const selector = new SessionSelectorComponent(
+			async () => sessions,
+			async () => sessions,
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings },
+		);
+		await flushPromises();
+
+		const previousPath = process.env.PATH;
+		process.env.PATH = "";
+		try {
+			const list = selector.getSessionList();
+			list.handleInput(CTRL_D);
+			list.handleInput("\r");
+			for (let attempt = 0; attempt < 20 && (existsSync(sessionPath) || existsSync(sidecarPath)); attempt++) {
+				await flushPromises();
+			}
+		} finally {
+			process.env.PATH = previousPath;
+		}
+
+		expect(existsSync(sessionPath)).toBe(false);
+		expect(existsSync(sidecarPath)).toBe(false);
+	});
+
+	it("preserves the session and sidecar while the durable journal is locked", async () => {
+		const baseDir = mkdtempSync(join(tmpdir(), "pi-session-selector-active-"));
+		tempDirs.push(baseDir);
+		const sessionPath = join(baseDir, "session.jsonl");
+		const sidecarPath = `${sessionPath}.operations.jsonl`;
+		writeFileSync(sessionPath, "session\n");
+		writeFileSync(sidecarPath, "durable operations\n");
+		const activeJournal = new DurableOperationJournal(sidecarPath, "session", { exclusive: true });
+		const sessions = [makeSession({ id: "session", path: sessionPath })];
+
+		const selector = new SessionSelectorComponent(
+			async () => sessions,
+			async () => sessions,
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings },
+		);
+		await flushPromises();
+
+		try {
+			const list = selector.getSessionList();
+			list.handleInput(CTRL_D);
+			list.handleInput("\r");
+			await flushPromises();
+
+			expect(existsSync(sessionPath)).toBe(true);
+			expect(existsSync(sidecarPath)).toBe(true);
+			expect(stripAnsi(selector.render(120).join("\n"))).toContain(
+				"Failed to delete: Session is already open for durable writes",
+			);
+		} finally {
+			activeJournal.close();
+		}
+	});
+
+	it("reclaims a stale durable lease before deleting a session", async () => {
+		const baseDir = mkdtempSync(join(tmpdir(), "pi-session-selector-stale-"));
+		tempDirs.push(baseDir);
+		const sessionPath = join(baseDir, "session.jsonl");
+		const sidecarPath = `${sessionPath}.operations.jsonl`;
+		const lockPath = `${sidecarPath}.lock`;
+		writeFileSync(sessionPath, "session\n");
+		writeFileSync(sidecarPath, "durable operations\n");
+		mkdirSync(lockPath);
+		writeFileSync(
+			join(lockPath, "owner.json"),
+			`${JSON.stringify({ schema: 1, pid: 2_000_000_000, token: "stale", createdAt: 1 })}\n`,
+		);
+		const sessions = [makeSession({ id: "session", path: sessionPath })];
+		const selector = new SessionSelectorComponent(
+			async () => sessions,
+			async () => sessions,
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings },
+		);
+		await flushPromises();
+
+		const previousPath = process.env.PATH;
+		process.env.PATH = "";
+		try {
+			const list = selector.getSessionList();
+			list.handleInput(CTRL_D);
+			list.handleInput("\r");
+			for (let attempt = 0; attempt < 20 && existsSync(sessionPath); attempt++) {
+				await flushPromises();
+			}
+		} finally {
+			process.env.PATH = previousPath;
+		}
+
+		expect(existsSync(sessionPath)).toBe(false);
+		expect(existsSync(sidecarPath)).toBe(false);
 	});
 });

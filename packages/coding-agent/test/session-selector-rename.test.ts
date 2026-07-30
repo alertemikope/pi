@@ -1,9 +1,24 @@
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { setKeybindings } from "@earendil-works/pi-tui";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { acquireDurableOperationLease } from "../src/core/durable-operations.ts";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type { SessionInfo } from "../src/core/session-manager.ts";
-import { SessionSelectorComponent } from "../src/modes/interactive/components/session-selector.ts";
+import {
+	renameInactiveSessionFile,
+	SessionSelectorComponent,
+} from "../src/modes/interactive/components/session-selector.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
+
+const tempDirs: string[] = [];
+
+afterEach(() => {
+	for (const dir of tempDirs.splice(0)) {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
 
 async function flushPromises(): Promise<void> {
 	await new Promise<void>((resolve) => {
@@ -107,5 +122,80 @@ describe("session selector rename", () => {
 
 		expect(renameSession).toHaveBeenCalledTimes(1);
 		expect(renameSession).toHaveBeenCalledWith(sessions[0]!.path, "XOld");
+	});
+
+	it("shows rename failures and exits rename mode", async () => {
+		const sessions = [makeSession({ id: "a", name: "Old" })];
+		const renameSession = vi.fn(async () => {
+			throw new Error("Session is already open for durable writes");
+		});
+
+		const keybindings = new KeybindingsManager();
+		const selector = new SessionSelectorComponent(
+			async () => sessions,
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ renameSession, showRenameHint: true, keybindings },
+		);
+		await flushPromises();
+
+		selector.getSessionList().handleInput(CTRL_R);
+		await flushPromises();
+		selector.handleInput("X");
+		selector.handleInput("\r");
+		await flushPromises();
+
+		const output = selector.render(120).join("\n");
+		expect(output).toContain("Resume Session");
+		expect(output).toContain("Failed to rename: Session is already open for durable writes");
+	});
+
+	it("renames an inactive session while holding its writer lease", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-session-rename-"));
+		tempDirs.push(dir);
+		const sessionPath = join(dir, "session.jsonl");
+		writeFileSync(
+			sessionPath,
+			`${JSON.stringify({
+				type: "session",
+				version: 3,
+				id: "rename-session",
+				timestamp: new Date().toISOString(),
+				cwd: dir,
+			})}\n`,
+		);
+
+		renameInactiveSessionFile(sessionPath, "Renamed");
+
+		expect(readFileSync(sessionPath, "utf8")).toContain('"type":"session_info"');
+		expect(readFileSync(sessionPath, "utf8")).toContain('"name":"Renamed"');
+		expect(existsSync(`${sessionPath}.operations.jsonl.lock`)).toBe(false);
+	});
+
+	it("does not mutate an inactive session locked by another writer", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-session-rename-locked-"));
+		tempDirs.push(dir);
+		const sessionPath = join(dir, "session.jsonl");
+		const original = `${JSON.stringify({
+			type: "session",
+			version: 3,
+			id: "locked-session",
+			timestamp: new Date().toISOString(),
+			cwd: dir,
+		})}\n`;
+		writeFileSync(sessionPath, original);
+		const lease = acquireDurableOperationLease(`${sessionPath}.operations.jsonl`);
+
+		try {
+			expect(() => renameInactiveSessionFile(sessionPath, "Must Not Persist")).toThrow(
+				"already open for durable writes",
+			);
+			expect(readFileSync(sessionPath, "utf8")).toBe(original);
+		} finally {
+			lease.release();
+		}
 	});
 });

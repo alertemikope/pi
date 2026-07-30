@@ -130,7 +130,7 @@ import {
 	OAuthSelectorComponent,
 } from "./components/oauth-selector.ts";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.ts";
-import { SessionSelectorComponent } from "./components/session-selector.ts";
+import { renameInactiveSessionFile, SessionSelectorComponent } from "./components/session-selector.ts";
 import { SettingsSelectorComponent } from "./components/settings-selector.ts";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.ts";
 import {
@@ -908,6 +908,13 @@ export class InteractiveMode {
 
 		if (modelFallbackMessage) {
 			this.showWarning(modelFallbackMessage);
+		}
+
+		const suspendedOperation = this.session.getSuspendedOperation();
+		if (suspendedOperation) {
+			this.showWarning(
+				`Durable operation ${suspendedOperation.id} was interrupted after ${suspendedOperation.checkpointCount} checkpoint(s). Run /recover to continue or /recover abort to discard it.`,
+			);
 		}
 
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
@@ -2785,6 +2792,21 @@ export class InteractiveMode {
 				const customInstructions = text.startsWith("/compact ") ? text.slice(9).trim() : undefined;
 				this.editor.setText("");
 				await this.handleCompactCommand(customInstructions);
+				return;
+			}
+			if (text === "/recover" || text === "/recover abort") {
+				this.editor.setText("");
+				try {
+					if (text === "/recover abort") {
+						const operation = this.session.abortSuspendedOperation();
+						this.showStatus(`Discarded interrupted operation ${operation.id}`);
+					} else {
+						await this.session.resumeSuspendedOperation();
+						this.showStatus("Interrupted operation recovered");
+					}
+				} catch (error) {
+					this.showError(error instanceof Error ? error.message : String(error));
+				}
 				return;
 			}
 			if (text === "/reload") {
@@ -4832,8 +4854,13 @@ export class InteractiveMode {
 					renameSession: async (sessionFilePath: string, nextName: string | undefined) => {
 						const next = (nextName ?? "").trim();
 						if (!next) return;
-						const mgr = SessionManager.open(sessionFilePath);
-						mgr.appendSessionInfo(next);
+						const activeSessionFile = this.sessionManager.getSessionFile();
+						if (activeSessionFile && path.resolve(sessionFilePath) === path.resolve(activeSessionFile)) {
+							this.session.setSessionName(next);
+							return;
+						}
+
+						renameInactiveSessionFile(sessionFilePath, next);
 					},
 					showRenameHint: true,
 					keybindings: this.keybindings,

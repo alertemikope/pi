@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { DurableOperationJournal } from "../src/core/durable-operations.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 
@@ -62,6 +63,40 @@ describe("createAgentSession session manager defaults", () => {
 		expect(session.sessionManager.isPersisted()).toBe(false);
 
 		session.dispose();
+	});
+
+	it("releases the pre-acquired lease when the session path changes during initialization", async () => {
+		const model = getModel("anthropic", "claude-sonnet-4-5");
+		expect(model).toBeTruthy();
+
+		const sessionDir = join(tempDir, "sessions");
+		const sessionManager = SessionManager.create(cwd, sessionDir);
+		const originalGetSessionFile = sessionManager.getSessionFile.bind(sessionManager);
+		const originalSessionFile = originalGetSessionFile();
+		if (!originalSessionFile) throw new Error("Expected a persisted session path");
+		const movedSessionFile = join(sessionDir, "moved.jsonl");
+		let getSessionFileCalls = 0;
+		sessionManager.getSessionFile = () => {
+			getSessionFileCalls += 1;
+			if (getSessionFileCalls === 2) {
+				sessionManager.setSessionFile(movedSessionFile);
+			}
+			return originalGetSessionFile();
+		};
+
+		await expect(
+			createAgentSession({
+				cwd,
+				agentDir,
+				model: model!,
+				sessionManager,
+			}),
+		).rejects.toThrow(/Session changed while acquiring its durable writer lease/);
+
+		const journal = new DurableOperationJournal(`${originalSessionFile}.operations.jsonl`, "probe", {
+			exclusive: true,
+		});
+		journal.close();
 	});
 
 	it("derives cwd from an explicit sessionManager when cwd is omitted", async () => {

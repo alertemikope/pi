@@ -13,8 +13,9 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
+import { acquireDurableOperationLease, type DurableOperationLease } from "../../../core/durable-operations.ts";
 import { KeybindingsManager } from "../../../core/keybindings.ts";
-import type { SessionInfo, SessionListProgress } from "../../../core/session-manager.ts";
+import { type SessionInfo, type SessionListProgress, SessionManager } from "../../../core/session-manager.ts";
 import { canonicalizePath as _canonicalizePath } from "../../../utils/paths.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
@@ -639,43 +640,82 @@ class SessionList implements Component, Focusable {
 
 type SessionsLoader = (onProgress?: SessionListProgress) => Promise<SessionInfo[]>;
 
+export function renameInactiveSessionFile(sessionPath: string, nextName: string): void {
+	const durableOperationsPath = `${sessionPath}.operations.jsonl`;
+	const lease = acquireDurableOperationLease(durableOperationsPath);
+	try {
+		if (!existsSync(sessionPath)) {
+			throw new Error(`Session no longer exists: ${sessionPath}`);
+		}
+		const manager = SessionManager.openExisting(sessionPath);
+		manager.assertDurableSourceUnchanged();
+		manager.ensurePersisted();
+		manager.appendSessionInfo(nextName);
+	} finally {
+		lease.release();
+	}
+}
+
 /**
  * Delete a session file, trying the `trash` CLI first, then falling back to unlink
  */
 async function deleteSessionFile(
 	sessionPath: string,
 ): Promise<{ ok: boolean; method: "trash" | "unlink"; error?: string }> {
-	// Try `trash` first (if installed)
-	const trashArgs = sessionPath.startsWith("-") ? ["--", sessionPath] : [sessionPath];
-	const trashResult = spawnSync("trash", trashArgs, { encoding: "utf-8" });
-
-	const getTrashErrorHint = (): string | null => {
-		const parts: string[] = [];
-		if (trashResult.error) {
-			parts.push(trashResult.error.message);
-		}
-		const stderr = trashResult.stderr?.trim();
-		if (stderr) {
-			parts.push(stderr.split("\n")[0] ?? stderr);
-		}
-		if (parts.length === 0) return null;
-		return `trash: ${parts.join(" · ").slice(0, 200)}`;
-	};
-
-	// If trash reports success, or the file is gone afterwards, treat it as successful
-	if (trashResult.status === 0 || !existsSync(sessionPath)) {
-		return { ok: true, method: "trash" };
+	const durableOperationsPath = `${sessionPath}.operations.jsonl`;
+	let lease: DurableOperationLease;
+	try {
+		lease = acquireDurableOperationLease(durableOperationsPath);
+	} catch (error) {
+		return {
+			ok: false,
+			method: "unlink",
+			error: error instanceof Error ? error.message : String(error),
+		};
 	}
 
-	// Fallback to permanent deletion
 	try {
-		await unlink(sessionPath);
-		return { ok: true, method: "unlink" };
-	} catch (err) {
-		const unlinkError = err instanceof Error ? err.message : String(err);
-		const trashErrorHint = getTrashErrorHint();
-		const error = trashErrorHint ? `${unlinkError} (${trashErrorHint})` : unlinkError;
-		return { ok: false, method: "unlink", error };
+		const targets = existsSync(durableOperationsPath) ? [sessionPath, durableOperationsPath] : [sessionPath];
+
+		// Try `trash` first (if installed)
+		const trashArgs = targets.some((target) => target.startsWith("-")) ? ["--", ...targets] : targets;
+		const trashResult = spawnSync("trash", trashArgs, { encoding: "utf-8" });
+
+		const getTrashErrorHint = (): string | null => {
+			const parts: string[] = [];
+			if (trashResult.error) {
+				parts.push(trashResult.error.message);
+			}
+			const stderr = trashResult.stderr?.trim();
+			if (stderr) {
+				parts.push(stderr.split("\n")[0] ?? stderr);
+			}
+			if (parts.length === 0) return null;
+			return `trash: ${parts.join(" · ").slice(0, 200)}`;
+		};
+
+		// Only report success once both the transcript and its exact sidecar are gone.
+		if (targets.every((target) => !existsSync(target))) {
+			return { ok: true, method: "trash" };
+		}
+
+		// Fallback to permanent deletion
+		try {
+			// Delete the sidecar first so a partial failure cannot orphan its durable data.
+			for (const target of [durableOperationsPath, sessionPath]) {
+				if (targets.includes(target) && existsSync(target)) {
+					await unlink(target);
+				}
+			}
+			return { ok: true, method: "unlink" };
+		} catch (err) {
+			const unlinkError = err instanceof Error ? err.message : String(err);
+			const trashErrorHint = getTrashErrorHint();
+			const error = trashErrorHint ? `${unlinkError} (${trashErrorHint})` : unlinkError;
+			return { ok: false, method: "unlink", error };
+		}
+	} finally {
+		lease.release();
 	}
 }
 
@@ -914,6 +954,9 @@ export class SessionSelectorComponent extends Container implements Focusable {
 		try {
 			await renameSession(target, next);
 			await this.refreshSessionsAfterMutation();
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.header.setStatusMessage({ type: "error", message: `Failed to rename: ${message}` }, 3000);
 		} finally {
 			this.exitRenameMode();
 		}

@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, parse } from "node:path";
+import { basename, join, parse } from "node:path";
 import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
@@ -11,6 +11,7 @@ import {
 	createAgentSessionServices,
 } from "../../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
+import { DurableOperationJournal } from "../../src/core/durable-operations.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import type {
 	AgentToolResult,
@@ -212,6 +213,60 @@ describe("AgentSessionRuntime characterization", () => {
 		]);
 	});
 
+	it("keeps the current runtime usable when the target writer lease cannot be acquired", async () => {
+		const { runtime, tempDir } = await createRuntimeForTest(() => {});
+		await runtime.session.prompt("current");
+		const currentSession = runtime.session;
+		const targetManager = SessionManager.create(tempDir, tempDir);
+		targetManager.ensurePersisted();
+		const targetSessionFile = targetManager.getSessionFile();
+		if (!targetSessionFile) {
+			throw new Error("missing target session file");
+		}
+		const blocker = new DurableOperationJournal(
+			`${targetSessionFile}.operations.jsonl`,
+			targetManager.getSessionId(),
+			{ exclusive: true },
+		);
+
+		try {
+			await expect(runtime.switchSession(targetSessionFile)).rejects.toThrow("already open for durable writes");
+			expect(runtime.session).toBe(currentSession);
+			await expect(runtime.session.prompt("still usable")).resolves.toBeUndefined();
+		} finally {
+			blocker.close();
+		}
+	});
+
+	it("imports a colliding basename without overwriting the current session", async () => {
+		const { runtime, tempDir } = await createRuntimeForTest(() => {});
+		await runtime.session.prompt("current transcript");
+		const currentSessionFile = runtime.session.sessionFile;
+		if (!currentSessionFile) {
+			throw new Error("missing current session file");
+		}
+		const currentBytes = readFileSync(currentSessionFile);
+		const externalSource = join(tempDir, basename(currentSessionFile));
+		const sourceEntries = currentBytes
+			.toString("utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		sourceEntries[0] = {
+			...sourceEntries[0],
+			id: "imported-collision-session",
+			cwd: tempDir,
+		};
+		writeFileSync(externalSource, `${sourceEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+
+		const result = await runtime.importFromJsonl(externalSource);
+
+		expect(result).toEqual({ cancelled: false });
+		expect(runtime.session.sessionId).toBe("imported-collision-session");
+		expect(runtime.session.sessionFile).not.toBe(currentSessionFile);
+		expect(readFileSync(currentSessionFile)).toEqual(currentBytes);
+	});
+
 	it("emits session_before_switch and session_start for new and resume flows", async () => {
 		const events: RecordedSessionEvent[] = [];
 		const { runtime } = await createRuntimeForTest((pi: ExtensionAPI) => {
@@ -341,17 +396,16 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(events).toEqual([{ type: "session_before_fork", entryId: "missing-entry", position: "at" }]);
 	});
 
-	it("reports why an unflushed session cannot be forked", async () => {
+	it("materializes a durable session early enough to fork before the first assistant response", async () => {
 		const { runtime } = await createRuntimeForTest(() => {});
 		const sessionFile = runtime.session.sessionFile;
 		const leafId = runtime.session.sessionManager.getLeafId();
 		expect(sessionFile).toBeDefined();
-		expect(existsSync(sessionFile!)).toBe(false);
+		expect(existsSync(sessionFile!)).toBe(true);
 		expect(leafId).toBeTruthy();
 
-		await expect(runtime.fork(leafId!, { position: "at" })).rejects.toThrow(
-			"This session has not been saved yet. Wait for the first assistant response before cloning or forking it.",
-		);
+		const result = await runtime.fork(leafId!, { position: "at" });
+		expect(result.cancelled).toBe(false);
 	});
 
 	it("duplicates the current active branch when forking at the current position", async () => {
@@ -571,11 +625,14 @@ describe("AgentSessionRuntime characterization", () => {
 			agentDir: tempDir,
 			sessionManager: SessionManager.create(secondDir),
 		});
+		let otherRuntimeOpen = true;
 		cleanups.push(async () => {
-			await otherRuntime.dispose();
+			if (otherRuntimeOpen) await otherRuntime.dispose();
 		});
 		await otherRuntime.session.prompt("other");
 		const otherSessionFile = otherRuntime.session.sessionFile!;
+		await otherRuntime.dispose();
+		otherRuntimeOpen = false;
 
 		await runtime.switchSession(otherSessionFile);
 
@@ -644,13 +701,16 @@ describe("AgentSessionRuntime characterization", () => {
 			agentDir: tempDir,
 			sessionManager: SessionManager.create(otherDir),
 		});
+		let otherRuntimeOpen = true;
 		cleanups.push(async () => {
-			await otherRuntime.dispose();
+			if (otherRuntimeOpen) await otherRuntime.dispose();
 		});
 		await otherRuntime.session.setModel(faux.getModel("faux-2")!);
 		otherRuntime.session.setThinkingLevel("off");
 		await otherRuntime.session.prompt("hello");
 		const targetSessionFile = otherRuntime.session.sessionFile!;
+		await otherRuntime.dispose();
+		otherRuntimeOpen = false;
 
 		await runtime.switchSession(targetSessionFile);
 
