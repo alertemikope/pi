@@ -48,6 +48,20 @@ export {
 	serializeConversation,
 	shouldCompact,
 } from "./core/compaction/index.ts";
+export {
+	acquireDurableOperationLease,
+	type DurableEffectClaim,
+	type DurableEffectSnapshot,
+	type DurableEffectStatus,
+	type DurableOperationHandle,
+	DurableOperationJournal,
+	type DurableOperationLease,
+	type DurableOperationOutcome,
+	type DurableOperationSnapshot,
+	type DurableOperationStatus,
+	type DurablePreparedInput,
+	type DurableReplayPolicy,
+} from "./core/durable-operations.ts";
 export { createEventBus, type EventBus, type EventBusController } from "./core/event-bus.ts";
 // Extension system
 export type {

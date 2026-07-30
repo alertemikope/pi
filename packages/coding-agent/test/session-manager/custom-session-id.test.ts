@@ -166,4 +166,31 @@ describe("SessionManager.newSession with custom id", () => {
 		expect(sessionFile).toContain("forked-session-id");
 		expect(basename(sessionFile)).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_forked-session-id\.jsonl$/);
 	});
+
+	it("can defer a cross-project fork until durable initialization", () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pi-session-manager-"));
+		const sourcePath = join(tempDir, "source.jsonl");
+		writeFileSync(
+			sourcePath,
+			`${JSON.stringify({
+				type: "session",
+				version: 3,
+				id: "source-session-id",
+				timestamp: new Date().toISOString(),
+				cwd: tempDir,
+			})}\n`,
+		);
+
+		const forked = SessionManager.forkFrom(sourcePath, tempDir, tempDir, {
+			id: "deferred-fork-id",
+			deferPersistence: true,
+		});
+		const sessionFile = forked.getSessionFile();
+		if (!sessionFile) throw new Error("missing fork target");
+
+		expect(existsSync(sessionFile)).toBe(false);
+		forked.assertDurableSourceUnchanged();
+		forked.ensurePersisted();
+		expect(SessionManager.openExisting(sessionFile).getSessionId()).toBe("deferred-fork-id");
+	});
 });

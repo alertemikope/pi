@@ -291,7 +291,7 @@ function validateSessionIdFlags(parsed: Args): void {
 
 function openSessionOrExit(path: string, sessionDir?: string): SessionManager {
 	try {
-		return SessionManager.open(path, sessionDir);
+		return SessionManager.openExisting(path, sessionDir);
 	} catch (error: unknown) {
 		const message = error instanceof Error ? error.message : String(error);
 		console.error(chalk.red(`Error: ${message}`));
@@ -301,7 +301,7 @@ function openSessionOrExit(path: string, sessionDir?: string): SessionManager {
 
 function forkSessionOrExit(sourcePath: string, cwd: string, sessionDir?: string, sessionId?: string): SessionManager {
 	try {
-		return SessionManager.forkFrom(sourcePath, cwd, sessionDir, { id: sessionId });
+		return SessionManager.forkFrom(sourcePath, cwd, sessionDir, { id: sessionId, deferPersistence: true });
 	} catch (error: unknown) {
 		const message = error instanceof Error ? error.message : String(error);
 		console.error(chalk.red(`Error: ${message}`));
@@ -377,7 +377,7 @@ async function createSessionManager(
 				console.log(chalk.dim("No session selected"));
 				process.exit(0);
 			}
-			return SessionManager.open(selectedPath, sessionDir);
+			return SessionManager.openExisting(selectedPath, sessionDir);
 		} finally {
 			stopThemeWatcher();
 		}
@@ -390,7 +390,7 @@ async function createSessionManager(
 	if (parsed.sessionId) {
 		const existingSession = await findLocalSessionByExactId(parsed.sessionId, cwd, sessionDir);
 		if (existingSession) {
-			return SessionManager.open(existingSession.path, sessionDir);
+			return SessionManager.openExisting(existingSession.path, sessionDir);
 		}
 		console.error(
 			chalk.yellow(
@@ -635,19 +635,16 @@ export async function main(args: string[], options?: MainOptions) {
 			if (!selectedCwd) {
 				process.exit(0);
 			}
-			sessionManager = SessionManager.open(missingSessionCwdIssue.sessionFile!, sessionDir, selectedCwd);
+			sessionManager = SessionManager.openExisting(missingSessionCwdIssue.sessionFile!, sessionDir, selectedCwd);
 		} else {
 			console.error(chalk.red(new MissingSessionCwdError(missingSessionCwdIssue).message));
 			process.exit(1);
 		}
 	}
-	if (parsed.name !== undefined) {
-		const name = parsed.name.trim();
-		if (!name) {
-			console.error(chalk.red("Error: --name requires a non-empty value"));
-			process.exit(1);
-		}
-		sessionManager.appendSessionInfo(name);
+	const startupSessionName = parsed.name?.trim();
+	if (parsed.name !== undefined && !startupSessionName) {
+		console.error(chalk.red("Error: --name requires a non-empty value"));
+		process.exit(1);
 	}
 	time("createSessionManager");
 
@@ -797,6 +794,9 @@ export async function main(args: string[], options?: MainOptions) {
 	});
 	time("createAgentSessionRuntime");
 	const { services, session, modelFallbackMessage } = runtime;
+	if (startupSessionName) {
+		session.setSessionName(startupSessionName);
+	}
 	const { settingsManager, modelRuntime, resourceLoader } = services;
 	applyHttpProxySettings(settingsManager.getGlobalSettings().httpProxy);
 	configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs());

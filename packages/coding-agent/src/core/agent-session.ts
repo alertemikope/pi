@@ -21,6 +21,7 @@ import type {
 	AgentMessage,
 	AgentState,
 	AgentTool,
+	AgentToolResult,
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
@@ -32,6 +33,7 @@ import type {
 	Model,
 	ProviderHeaders,
 	TextContent,
+	ToolResultMessage,
 	Usage,
 } from "@earendil-works/pi-ai/compat";
 import {
@@ -63,6 +65,14 @@ import {
 	shouldCompact,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
+import {
+	acquireDurableOperationLease,
+	type DurableOperationHandle,
+	DurableOperationJournal,
+	type DurableOperationLease,
+	type DurableOperationSnapshot,
+	durableValueFingerprint,
+} from "./durable-operations.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
@@ -98,7 +108,12 @@ import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
-import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
+import {
+	CURRENT_SESSION_VERSION,
+	getLatestCompactionEntry,
+	loadEntriesFromFile,
+	type SessionHeader,
+} from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -181,7 +196,76 @@ export type AgentSessionEvent =
 	| { type: "bash_execution_update"; id?: string; delta: string };
 
 /** Listener function for agent session events */
-export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
+export type AgentSessionEventListener = (event: AgentSessionEvent) => void | Promise<void>;
+
+/**
+ * Clone arbitrary observer payloads without ever falling back to the live value.
+ *
+ * Session events are data-only in normal operation, so structuredClone handles
+ * the fast path. Custom message/tool details can still contain values it rejects
+ * (most notably functions); the fallback recursively copies their data surface
+ * and replaces function values with undefined.
+ */
+function cloneObserverValue(value: unknown, seen: Map<object, unknown>): unknown {
+	if (typeof value === "function") return undefined;
+	if (value === null || typeof value !== "object") return value;
+
+	const existing = seen.get(value);
+	if (existing !== undefined) return existing;
+
+	try {
+		const clone = structuredClone(value);
+		seen.set(value, clone);
+		return clone;
+	} catch {
+		// Fall through to a defensive data-only clone for non-cloneable details.
+	}
+
+	if (Array.isArray(value)) {
+		const clone: unknown[] = [];
+		seen.set(value, clone);
+		for (const item of value) {
+			clone.push(cloneObserverValue(item, seen));
+		}
+		return clone;
+	}
+
+	if (value instanceof Map) {
+		const clone = new Map<unknown, unknown>();
+		seen.set(value, clone);
+		for (const [key, item] of value) {
+			clone.set(cloneObserverValue(key, seen), cloneObserverValue(item, seen));
+		}
+		return clone;
+	}
+
+	if (value instanceof Set) {
+		const clone = new Set<unknown>();
+		seen.set(value, clone);
+		for (const item of value) {
+			clone.add(cloneObserverValue(item, seen));
+		}
+		return clone;
+	}
+
+	const clone: Record<PropertyKey, unknown> = {};
+	seen.set(value, clone);
+	for (const key of Reflect.ownKeys(value)) {
+		const descriptor = Object.getOwnPropertyDescriptor(value, key);
+		if (!descriptor?.enumerable) continue;
+		Object.defineProperty(clone, key, {
+			value: "value" in descriptor ? cloneObserverValue(descriptor.value, seen) : undefined,
+			enumerable: true,
+			configurable: true,
+			writable: true,
+		});
+	}
+	return clone;
+}
+
+function cloneAgentSessionEvent(event: AgentSessionEvent): AgentSessionEvent {
+	return cloneObserverValue(event, new Map()) as AgentSessionEvent;
+}
 
 // ============================================================================
 // Types
@@ -223,6 +307,8 @@ export interface AgentSessionConfig {
 	extensionRunnerRef?: { current?: ExtensionRunner };
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Pre-acquired writer lease transferred by the SDK before session initialization writes. */
+	durableLease?: DurableOperationLease;
 }
 
 export interface ExtensionBindings {
@@ -371,6 +457,20 @@ export class AgentSession {
 	private _baseSystemPrompt = "";
 	private _baseSystemPromptOptions!: BuildSystemPromptOptions;
 	private _systemPromptOverride?: string;
+	private readonly _durableOperations: DurableOperationJournal | undefined;
+	private _activeDurableOperation: DurableOperationHandle | undefined;
+	private _suspendedDurableOperation: DurableOperationSnapshot | undefined;
+	private readonly _durableEffectKeys = new Map<string, string>();
+	private readonly _pendingDurableToolIdentities = new Map<
+		string,
+		Array<{ assistantEntryId: string; toolIndex: number }>
+	>();
+	private readonly _durableToolExecutionsAwaitingEnd = new Map<string, number>();
+	private _pendingDurablePreparedInput:
+		| { messages: AgentMessage[]; nextIndex: number; systemPrompt?: string }
+		| undefined;
+	private _disposeStarted = false;
+	private _disposeFinalized = false;
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
@@ -387,17 +487,54 @@ export class AgentSession {
 		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+		const sessionFile = this.sessionManager.getSessionFile();
+		if (sessionFile) {
+			const lease = config.durableLease ?? acquireDurableOperationLease(`${sessionFile}.operations.jsonl`);
+			const journal = new DurableOperationJournal(
+				`${sessionFile}.operations.jsonl`,
+				this.sessionManager.getSessionId(),
+				{ lease },
+			);
+			try {
+				this.sessionManager.assertDurableSourceUnchanged();
+				this.sessionManager.ensurePersisted();
+				const physicalHeader = loadEntriesFromFile(sessionFile)[0];
+				if (
+					!existsSync(sessionFile) ||
+					physicalHeader?.type !== "session" ||
+					physicalHeader.id !== this.sessionManager.getSessionId()
+				) {
+					throw new Error(
+						`Session changed or was deleted while acquiring its durable writer lease: ${sessionFile}`,
+					);
+				}
+			} catch (error) {
+				journal.close();
+				throw error;
+			}
+			this._durableOperations = journal;
+		} else {
+			this._durableOperations = undefined;
+		}
 
-		// Always subscribe to agent events for internal handling
-		// (session persistence, extensions, auto-compaction, retry logic)
-		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
-		this._installAgentToolHooks();
-		this._installAgentNextTurnRefresh();
+		try {
+			this._suspendedDurableOperation = this._durableOperations?.recoverInFlight();
 
-		this._buildRuntime({
-			activeToolNames: this._initialActiveToolNames,
-			includeAllExtensionTools: true,
-		});
+			// Always subscribe to agent events for internal handling
+			// (session persistence, extensions, auto-compaction, retry logic)
+			this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
+			this._installAgentToolHooks();
+			this._installAgentNextTurnRefresh();
+			this._installDurableProviderHook();
+
+			this._buildRuntime({
+				activeToolNames: this._initialActiveToolNames,
+				includeAllExtensionTools: true,
+			});
+		} catch (error) {
+			this._durableOperations?.close();
+			throw error;
+		}
 	}
 
 	get modelRuntime(): ModelRuntime {
@@ -540,14 +677,39 @@ export class AgentSession {
 		};
 	}
 
+	private _installDurableProviderHook(): void {
+		const previousOnPayload = this.agent.onPayload;
+		this.agent.onPayload = async (payload, model) => {
+			if (this._durableOperations && this._activeDurableOperation) {
+				this._durableOperations.checkpoint(this._activeDurableOperation, "provider_request", {
+					provider: model.provider,
+					model: model.id,
+				});
+			}
+			return previousOnPayload ? await previousOnPayload(payload, model) : payload;
+		};
+	}
+
 	// =========================================================================
 	// Event Subscription
 	// =========================================================================
 
-	/** Emit an event to all listeners */
+	/** Emit an observational event without allowing listeners to affect execution. */
 	private _emit(event: AgentSessionEvent): void {
 		for (const l of this._eventListeners) {
-			l(event);
+			try {
+				// Clone per listener: one observer cannot mutate the agent's live state
+				// or the value delivered to any later observer.
+				const result = l(cloneAgentSessionEvent(event));
+				if (result && typeof result.then === "function") {
+					void result.catch(() => {
+						// Async observers are isolated for the same reason as sync ones.
+					});
+				}
+			} catch {
+				// Session event subscribers are passive observers. A broken UI or
+				// telemetry listener must not interrupt the agent or other listeners.
+			}
 		}
 	}
 
@@ -618,11 +780,60 @@ export class AgentSession {
 		// Emit to extensions first
 		await this._emitExtensionEvent(event);
 
-		// Notify all listeners
-		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
+		if (event.type === "message_end" && this._durableOperations && this._activeDurableOperation) {
+			if (event.message.role === "assistant") {
+				const seenToolCallIds = new Set<string>();
+				for (const content of event.message.content) {
+					if (content.type !== "toolCall") continue;
+					if (seenToolCallIds.has(content.id)) {
+						throw new Error(`Assistant response contains duplicate tool call id ${content.id}`);
+					}
+					seenToolCallIds.add(content.id);
+				}
+			}
+
+			const pendingPrepared = this._pendingDurablePreparedInput;
+			if (pendingPrepared && pendingPrepared.nextIndex < pendingPrepared.messages.length) {
+				const expected = pendingPrepared.messages[pendingPrepared.nextIndex]!;
+				if (expected.role !== event.message.role) {
+					throw new Error(
+						`Prepared message role changed from ${expected.role} to ${event.message.role} before provider execution`,
+					);
+				}
+				pendingPrepared.messages[pendingPrepared.nextIndex] = event.message;
+				pendingPrepared.nextIndex += 1;
+				this._durableOperations.updatePrepared(this._activeDurableOperation, {
+					messages: pendingPrepared.messages,
+					systemPrompt: pendingPrepared.systemPrompt,
+				});
+				if (pendingPrepared.nextIndex === pendingPrepared.messages.length) {
+					this._pendingDurablePreparedInput = undefined;
+				}
+			}
+
+			if (event.message.role === "toolResult") {
+				const effectKey = this._durableEffectKeys.get(event.message.toolCallId);
+				if (effectKey) {
+					try {
+						this._durableOperations.finishEffect(
+							this._activeDurableOperation,
+							effectKey,
+							event.message.isError ? "failed" : "completed",
+							event.message,
+							event.message.isError
+								? contentText(event.message.content ?? [], "Tool execution failed")
+								: undefined,
+						);
+					} finally {
+						this._durableEffectKeys.delete(event.message.toolCallId);
+					}
+				}
+			}
+		}
 
 		// Handle session persistence
 		if (event.type === "message_end") {
+			let persistedMessageEntryId: string | undefined;
 			// Check if this is a custom message from extensions
 			if (event.message.role === "custom") {
 				// Persist as CustomMessageEntry
@@ -631,6 +842,7 @@ export class AgentSession {
 					event.message.content,
 					event.message.display,
 					event.message.details,
+					event.message.timestamp,
 				);
 			} else if (
 				event.message.role === "user" ||
@@ -638,13 +850,21 @@ export class AgentSession {
 				event.message.role === "toolResult"
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
+				persistedMessageEntryId = this.sessionManager.appendMessage(event.message);
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
 			// Track assistant message for auto-compaction (checked on agent_end)
 			if (event.message.role === "assistant") {
 				this._lastAssistantMessage = event.message;
+				if (persistedMessageEntryId) {
+					for (const [toolIndex, content] of event.message.content.entries()) {
+						if (content.type !== "toolCall") continue;
+						const identities = this._pendingDurableToolIdentities.get(content.id) ?? [];
+						identities.push({ assistantEntryId: persistedMessageEntryId, toolIndex });
+						this._pendingDurableToolIdentities.set(content.id, identities);
+					}
+				}
 
 				const assistantMsg = event.message as AssistantMessage;
 				if (assistantMsg.stopReason !== "error") {
@@ -663,6 +883,43 @@ export class AgentSession {
 				}
 			}
 		}
+
+		if (this._durableOperations && this._activeDurableOperation) {
+			if (event.type === "tool_execution_end") {
+				const consumedExecutions = this._durableToolExecutionsAwaitingEnd.get(event.toolCallId) ?? 0;
+				if (consumedExecutions > 1) {
+					this._durableToolExecutionsAwaitingEnd.set(event.toolCallId, consumedExecutions - 1);
+				} else if (consumedExecutions === 1) {
+					this._durableToolExecutionsAwaitingEnd.delete(event.toolCallId);
+				} else {
+					const identities = this._pendingDurableToolIdentities.get(event.toolCallId);
+					identities?.shift();
+					if (identities?.length === 0) {
+						this._pendingDurableToolIdentities.delete(event.toolCallId);
+					}
+				}
+				this._durableOperations.checkpoint(this._activeDurableOperation, "tool_execution_end", {
+					toolCallId: event.toolCallId,
+					toolName: event.toolName,
+					isError: event.isError,
+				});
+			} else if (event.type === "message_end" && event.message.role === "toolResult") {
+				this._durableOperations.checkpoint(this._activeDurableOperation, "tool_result", {
+					toolCallId: event.message.toolCallId,
+					toolName: event.message.toolName,
+					isError: event.message.isError,
+				});
+			} else if (event.type === "turn_end") {
+				this._durableOperations.checkpoint(this._activeDurableOperation, "turn_end", {
+					toolResults: event.toolResults.length,
+					stopReason: event.message.role === "assistant" ? event.message.stopReason : undefined,
+				});
+			}
+		}
+
+		// Notify observers only after durable state and transcript persistence have
+		// reached the checkpoint represented by this event.
+		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
 	};
 
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
@@ -835,6 +1092,8 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		if (this._disposeStarted) return;
+		this._disposeStarted = true;
 		try {
 			this.abortRetry();
 			this.abortCompaction();
@@ -845,10 +1104,24 @@ export class AgentSession {
 			// Dispose must succeed even if an abort hook throws.
 		}
 
+		if (this.isIdle) {
+			this._finalizeDispose();
+			return;
+		}
+		void this.waitForIdle().then(
+			() => this._finalizeDispose(),
+			() => this._finalizeDispose(),
+		);
+	}
+
+	private _finalizeDispose(): void {
+		if (this._disposeFinalized) return;
+		this._disposeFinalized = true;
 		this._extensionRunner.invalidate(
 			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
 		);
 		this._disconnectFromAgent();
+		this._durableOperations?.close();
 		this._eventListeners = [];
 		cleanupSessionResources(this.sessionId);
 	}
@@ -1058,18 +1331,289 @@ export class AgentSession {
 	// Prompting
 	// =========================================================================
 
-	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+	private _describeDurablePrompt(messages: AgentMessage | AgentMessage[]): string {
+		const batch = Array.isArray(messages) ? messages : [messages];
+		const text = batch
+			.flatMap((message) => {
+				if (
+					message.role === "user" ||
+					message.role === "assistant" ||
+					message.role === "toolResult" ||
+					message.role === "custom"
+				) {
+					const value = contentText(message.content, "").trim();
+					return value ? [value] : [];
+				}
+				return [];
+			})
+			.join("\n\n")
+			.trim();
+		return text || "[non-text agent operation]";
+	}
+
+	private async _runAgentPrompt(
+		messages: AgentMessage | AgentMessage[],
+		resumedOperation?: DurableOperationHandle,
+		onAccepted?: () => void,
+	): Promise<void> {
+		if (!resumedOperation && this._durableOperations) {
+			this.sessionManager.ensurePersisted();
+		}
+		const batch = Array.isArray(messages) ? messages : [messages];
+		const durableOperation =
+			resumedOperation ??
+			this._durableOperations?.begin(this._describeDurablePrompt(messages), {
+				messages: batch,
+				systemPrompt: this.agent.state.systemPrompt,
+			});
+		onAccepted?.();
+		this._activeDurableOperation = durableOperation;
+		this._suspendedDurableOperation = undefined;
+		this._pendingDurablePreparedInput =
+			!resumedOperation && durableOperation
+				? {
+						messages: batch.slice(),
+						nextIndex: 0,
+						systemPrompt: this.agent.state.systemPrompt,
+					}
+				: undefined;
 		this._isAgentRunActive = true;
+		let outcome: "completed" | "failed" | "aborted" = "completed";
+		let operationError: string | undefined;
+		let operationSuspended = false;
+		let deferredError: Error | undefined;
 		try {
 			await this.agent.prompt(messages);
 			while (await this._handlePostAgentRun()) {
 				await this.agent.continue();
 			}
+			const lastAssistant = this._findLastAssistantMessage();
+			if (lastAssistant?.stopReason === "aborted") {
+				outcome = "aborted";
+				operationError = lastAssistant.errorMessage;
+			} else if (lastAssistant?.stopReason === "error") {
+				outcome = "failed";
+				operationError = lastAssistant.errorMessage;
+			}
+		} catch (error) {
+			deferredError = error instanceof Error ? error : new Error(String(error));
+			operationError = deferredError.message;
+			if (this._durableOperations && durableOperation) {
+				this._suspendedDurableOperation = this._durableOperations.suspend(durableOperation, operationError);
+				operationSuspended = true;
+			} else {
+				outcome = "failed";
+			}
 		} finally {
-			this._systemPromptOverride = undefined;
-			this._flushPendingBashMessages();
-			await this._emitAgentSettled();
+			try {
+				if (this._durableOperations && durableOperation && !operationSuspended) {
+					try {
+						this._durableOperations.finish(durableOperation, outcome, operationError);
+					} catch (error) {
+						const finishError = error instanceof Error ? error : new Error(String(error));
+						this._suspendedDurableOperation = this._durableOperations.suspend(
+							durableOperation,
+							finishError.message,
+						);
+						deferredError ??= finishError;
+					}
+				}
+			} finally {
+				this._activeDurableOperation = undefined;
+				this._durableEffectKeys.clear();
+				this._pendingDurableToolIdentities.clear();
+				this._durableToolExecutionsAwaitingEnd.clear();
+				this._pendingDurablePreparedInput = undefined;
+				this._systemPromptOverride = undefined;
+				this._flushPendingBashMessages();
+				await this._emitAgentSettled();
+			}
 		}
+		if (deferredError) throw deferredError;
+	}
+
+	getSuspendedOperation(): DurableOperationSnapshot | undefined {
+		const suspended = this._durableOperations?.latestSuspended() ?? this._suspendedDurableOperation;
+		return suspended ? { ...suspended, effects: suspended.effects.map((effect) => ({ ...effect })) } : undefined;
+	}
+
+	private _restorePreparedMessages(prepared: unknown[]): void {
+		const counts = new Map<string, number>();
+		for (const message of this.agent.state.messages) {
+			const fingerprint = durableValueFingerprint(message);
+			counts.set(fingerprint, (counts.get(fingerprint) ?? 0) + 1);
+		}
+
+		for (const value of prepared) {
+			if (!value || typeof value !== "object" || !("role" in value)) {
+				throw new Error("Suspended operation contains an invalid prepared message.");
+			}
+			const role = (value as { role?: unknown }).role;
+			if (role !== "user" && role !== "assistant" && role !== "toolResult" && role !== "custom") {
+				throw new Error("Suspended operation contains an unsupported prepared message.");
+			}
+			const message = value as AgentMessage;
+			const fingerprint = durableValueFingerprint(message);
+			const remaining = counts.get(fingerprint) ?? 0;
+			if (remaining > 0) {
+				counts.set(fingerprint, remaining - 1);
+				continue;
+			}
+
+			// Prepared messages have already passed extension message hooks. Restore
+			// them directly so recovery cannot transform or persist them a second time.
+			if (message.role === "custom") {
+				this.sessionManager.appendCustomMessageEntry(
+					message.customType,
+					message.content,
+					message.display,
+					message.details,
+					message.timestamp,
+				);
+			} else if (message.role === "user" || message.role === "assistant" || message.role === "toolResult") {
+				this.sessionManager.appendMessage(message);
+			} else {
+				throw new Error("Suspended operation contains an unsupported prepared message.");
+			}
+			this.agent.state.messages.push(message);
+		}
+	}
+
+	private _hasAssistantToolCall(effect: DurableOperationSnapshot["effects"][number]): boolean {
+		const entry = this.sessionManager.getEntry(effect.assistantEntryId);
+		if (entry?.type !== "message" || entry.message.role !== "assistant") {
+			return false;
+		}
+		const content = entry.message.content[effect.toolIndex];
+		return content?.type === "toolCall" && content.id === effect.toolCallId && content.name === effect.toolName;
+	}
+
+	private _hasToolResult(effect: DurableOperationSnapshot["effects"][number]): boolean {
+		const branch = this.sessionManager.getBranch();
+		const originIndex = branch.findIndex((entry) => entry.id === effect.assistantEntryId);
+		if (originIndex < 0) return false;
+
+		for (const entry of branch.slice(originIndex + 1)) {
+			if (entry.type !== "message") continue;
+			if (entry.message.role === "assistant" || entry.message.role === "user") {
+				return false;
+			}
+			if (
+				entry.message.role === "toolResult" &&
+				entry.message.toolCallId === effect.toolCallId &&
+				entry.message.toolName === effect.toolName
+			) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private _reconcileDurableEffects(snapshot: DurableOperationSnapshot): void {
+		const journal = this._durableOperations;
+		if (!journal) return;
+
+		for (const effect of snapshot.effects) {
+			if (effect.reconciled) continue;
+			if (this._hasToolResult(effect)) {
+				journal.markEffectReconciled(snapshot.id, effect.key);
+				continue;
+			}
+			if (!this._hasAssistantToolCall(effect)) {
+				throw new Error(
+					`Cannot recover tool call ${effect.toolCallId}: its originating assistant message is missing.`,
+				);
+			}
+
+			const storedResult =
+				effect.result && typeof effect.result === "object"
+					? (effect.result as {
+							content?: ToolResultMessage<unknown>["content"];
+							details?: unknown;
+							usage?: ToolResultMessage<unknown>["usage"];
+							addedToolNames?: string[];
+						})
+					: undefined;
+			const interrupted = effect.status === "running" || effect.status === "uncertain";
+			const fallbackText = interrupted
+				? "Tool execution was interrupted. Its external outcome is unknown; inspect current state before retrying."
+				: effect.error || `Recovered ${effect.toolName} result was unavailable.`;
+			const toolResult: ToolResultMessage<unknown> = {
+				role: "toolResult",
+				toolCallId: effect.toolCallId,
+				toolName: effect.toolName,
+				content: Array.isArray(storedResult?.content)
+					? storedResult.content
+					: [{ type: "text", text: fallbackText }],
+				details: storedResult?.details,
+				usage: storedResult?.usage,
+				...(storedResult?.addedToolNames?.length ? { addedToolNames: storedResult.addedToolNames } : {}),
+				isError: effect.status !== "completed",
+				timestamp: Date.now(),
+			};
+
+			// Persist the transcript first. If the process stops before the journal
+			// acknowledgement, the next recovery observes this exact tool result
+			// and only appends tool_reconciled.
+			this.agent.state.messages.push(toolResult);
+			this.sessionManager.appendMessage(toolResult);
+			journal.markEffectReconciled(snapshot.id, effect.key);
+		}
+	}
+
+	async resumeSuspendedOperation(): Promise<void> {
+		if (!this._durableOperations) {
+			throw new Error("Durable operations are unavailable for in-memory sessions.");
+		}
+		if (this.isStreaming) {
+			throw new Error("Wait for the current response to finish before recovering an operation.");
+		}
+		await this._assertModelAndAuthReady();
+		const suspended = this._durableOperations.latestSuspended();
+		if (!suspended) {
+			throw new Error("No suspended operation is available for this session.");
+		}
+		if (suspended.prepared?.systemPrompt !== undefined) {
+			this._systemPromptOverride = suspended.prepared.systemPrompt;
+			this.agent.state.systemPrompt = suspended.prepared.systemPrompt;
+		}
+		if (suspended.prepared) {
+			this._restorePreparedMessages(suspended.prepared.messages);
+		}
+		this._reconcileDurableEffects(suspended);
+		const { operation, prompt } = this._durableOperations.resume();
+		const recoveryText = [
+			`[RECOVERY attempt ${operation.attempt}]`,
+			"The previous durable operation was interrupted.",
+			"Inspect the current session and filesystem before continuing.",
+			"Do not repeat a completed external effect. If an effect is uncertain, verify its result first.",
+			`Original request: ${prompt}`,
+		].join("\n");
+		await this._runAgentPrompt(
+			{
+				role: "user",
+				content: [{ type: "text", text: recoveryText }],
+				timestamp: Date.now(),
+			},
+			operation,
+		);
+	}
+
+	abortSuspendedOperation(): DurableOperationSnapshot {
+		if (!this._durableOperations) {
+			throw new Error("Durable operations are unavailable for in-memory sessions.");
+		}
+		const suspended = this._durableOperations.latestSuspended();
+		if (!suspended) {
+			throw new Error("No suspended operation is available for this session.");
+		}
+		if (suspended.prepared) {
+			this._restorePreparedMessages(suspended.prepared.messages);
+		}
+		this._reconcileDurableEffects(suspended);
+		const operation = this._durableOperations.abortSuspended();
+		this._suspendedDurableOperation = undefined;
+		return operation;
 	}
 
 	private async _handlePostAgentRun(): Promise<boolean> {
@@ -1102,6 +1646,27 @@ export class AgentSession {
 		return this.agent.hasQueuedMessages();
 	}
 
+	private async _assertModelAndAuthReady(): Promise<void> {
+		if (!this.model) {
+			throw new Error(formatNoModelSelectedMessage());
+		}
+
+		const hasConfiguredAuth =
+			this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
+			(await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
+		if (hasConfiguredAuth) return;
+
+		const isOAuth = this._modelRuntime.isUsingOAuth(this.model.provider);
+		if (isOAuth) {
+			throw new Error(
+				`Authentication failed for "${this.model.provider}". ` +
+					`Credentials may have expired or network is unavailable. ` +
+					`Run '/login ${this.model.provider}' to re-authenticate.`,
+			);
+		}
+		throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
+	}
+
 	/**
 	 * Send a prompt to the agent.
 	 * - Handles extension commands (registered via pi.registerCommand) immediately, even during streaming
@@ -1115,6 +1680,13 @@ export class AgentSession {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
+		const suspendedOperation = this.getSuspendedOperation();
+		if (suspendedOperation) {
+			preflightResult?.(false);
+			throw new Error(
+				`Operation ${suspendedOperation.id} is suspended. Run /recover to continue it or /recover abort to discard it.`,
+			);
+		}
 
 		try {
 			// Handle extension commands first (execute immediately, even during streaming)
@@ -1174,25 +1746,7 @@ export class AgentSession {
 			// Flush any pending bash messages before the new prompt
 			this._flushPendingBashMessages();
 
-			// Validate model
-			if (!this.model) {
-				throw new Error(formatNoModelSelectedMessage());
-			}
-
-			const hasConfiguredAuth =
-				this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
-				(await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
-			if (!hasConfiguredAuth) {
-				const isOAuth = this._modelRuntime.isUsingOAuth(this.model.provider);
-				if (isOAuth) {
-					throw new Error(
-						`Authentication failed for "${this.model.provider}". ` +
-							`Credentials may have expired or network is unavailable. ` +
-							`Run '/login ${this.model.provider}' to re-authenticate.`,
-					);
-				}
-				throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
-			}
+			await this._assertModelAndAuthReady();
 
 			// Check if we need to compact before sending (catches aborted responses).
 			// The user's new prompt is sent below, so do not call agent.continue() here.
@@ -1260,8 +1814,18 @@ export class AgentSession {
 			return;
 		}
 
-		preflightResult?.(true);
-		await this._runAgentPrompt(messages);
+		let accepted = false;
+		try {
+			await this._runAgentPrompt(messages, undefined, () => {
+				accepted = true;
+				preflightResult?.(true);
+			});
+		} catch (error) {
+			if (!accepted) {
+				preflightResult?.(false);
+			}
+			throw error;
+		}
 	}
 
 	/**
@@ -1456,6 +2020,7 @@ export class AgentSession {
 				message.content,
 				message.display,
 				message.details,
+				appMessage.timestamp,
 			);
 			this._emit({ type: "message_start", message: appMessage });
 			this._emit({ type: "message_end", message: appMessage });
@@ -1781,6 +2346,12 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
+		const suspendedOperation = this.getSuspendedOperation();
+		if (suspendedOperation) {
+			throw new Error(
+				`Operation ${suspendedOperation.id} is suspended. Recover or abort it before compacting this session.`,
+			);
+		}
 		this._disconnectFromAgent();
 		await this.abort();
 		this._compactionAbortController = new AbortController();
@@ -2452,6 +3023,50 @@ export class AgentSession {
 		);
 	}
 
+	private _wrapDurableTool(tool: AgentTool, replay: "safe" | "never"): AgentTool {
+		const execute = tool.execute.bind(tool);
+		return {
+			...tool,
+			execute: async (toolCallId, params, signal, onUpdate) => {
+				const journal = this._durableOperations;
+				const operation = this._activeDurableOperation;
+				if (!journal || !operation) {
+					return await execute(toolCallId, params, signal, onUpdate);
+				}
+
+				const identities = this._pendingDurableToolIdentities.get(toolCallId);
+				const identity = identities?.shift();
+				if (!identity) {
+					throw new Error(`Missing durable assistant entry identity for tool call ${toolCallId}`);
+				}
+				if (identities && identities.length === 0) {
+					this._pendingDurableToolIdentities.delete(toolCallId);
+				}
+				this._durableToolExecutionsAwaitingEnd.set(
+					toolCallId,
+					(this._durableToolExecutionsAwaitingEnd.get(toolCallId) ?? 0) + 1,
+				);
+				const claim = journal.claimEffect(operation, {
+					assistantEntryId: identity.assistantEntryId,
+					toolIndex: identity.toolIndex,
+					toolCallId,
+					toolName: tool.name,
+					args: params,
+					replay,
+				});
+				if (claim.kind === "reuse") {
+					return claim.result as AgentToolResult<unknown>;
+				}
+
+				if (this._durableEffectKeys.has(toolCallId)) {
+					throw new Error(`Duplicate active durable tool call id ${toolCallId}`);
+				}
+				this._durableEffectKeys.set(toolCallId, claim.key);
+				return await execute(toolCallId, params, signal, onUpdate);
+			},
+		};
+	}
+
 	private _refreshToolRegistry(options?: { activeToolNames?: string[]; includeAllExtensionTools?: boolean }): void {
 		const previousRegistryNames = new Set(this._toolRegistry.keys());
 		const previousActiveToolNames = this.getActiveToolNames();
@@ -2514,9 +3129,16 @@ export class AgentSession {
 			runner,
 		);
 
-		const toolRegistry = new Map(wrappedBuiltInTools.map((tool) => [tool.name, tool]));
+		const toolRegistry = new Map(
+			wrappedBuiltInTools.map((tool) => {
+				const replay = !this._baseToolsOverride && tool.name === "read" ? "safe" : "never";
+				const durableTool = this._wrapDurableTool(tool, replay);
+				return [durableTool.name, durableTool] as const;
+			}),
+		);
 		for (const tool of wrappedExtensionTools as AgentTool[]) {
-			toolRegistry.set(tool.name, tool);
+			const durableTool = this._wrapDurableTool(tool, "never");
+			toolRegistry.set(durableTool.name, durableTool);
 		}
 		this._toolRegistry = toolRegistry;
 
@@ -2898,6 +3520,12 @@ export class AgentSession {
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
 		if (this.isStreaming) {
 			throw new Error("Wait for the current response to finish before navigating the session tree.");
+		}
+		const suspendedOperation = this.getSuspendedOperation();
+		if (suspendedOperation) {
+			throw new Error(
+				`Operation ${suspendedOperation.id} is suspended. Recover or abort it before navigating this session.`,
+			);
 		}
 
 		const oldLeafId = this.sessionManager.getLeafId();

@@ -14,7 +14,7 @@ import {
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
-import { join, resolve } from "path";
+import { basename, join, resolve } from "path";
 import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
@@ -41,6 +41,16 @@ export interface SessionHeader {
 export interface NewSessionOptions {
 	id?: string;
 	parentSession?: string;
+}
+
+export interface ForkSessionOptions extends NewSessionOptions {
+	/** Keep the target virtual until its runtime has acquired the durable writer lease. */
+	deferPersistence?: boolean;
+}
+
+export interface BranchedSessionOptions {
+	/** Keep the target virtual until its runtime has acquired the durable writer lease. */
+	deferPersistence?: boolean;
 }
 
 export interface SessionEntryBase {
@@ -490,14 +500,36 @@ export function getDefaultSessionDir(cwd: string, agentDir: string = getDefaultA
 
 const SESSION_READ_BUFFER_SIZE = 1024 * 1024;
 const SESSION_HEADER_READ_BUFFER_SIZE = 4096;
+const DURABLE_OPERATION_SIDECAR_SUFFIX = ".operations.jsonl";
 /** Bound synchronous header discovery while allowing large cwd and custom metadata fields. */
 const MAX_SESSION_HEADER_SCAN_BYTES = 1024 * 1024;
+
+function isSessionTranscriptFile(fileName: string): boolean {
+	return fileName.endsWith(".jsonl") && !fileName.endsWith(DURABLE_OPERATION_SIDECAR_SUFFIX);
+}
 
 class SessionHeaderScanLimitError extends Error {
 	constructor(filePath: string) {
 		super(`Session header exceeds ${MAX_SESSION_HEADER_SCAN_BYTES}-byte scan limit: ${filePath}`);
 		this.name = "SessionHeaderScanLimitError";
 	}
+}
+
+class SessionFileNotFoundError extends Error {
+	constructor(filePath: string) {
+		super(`Session file does not exist: ${filePath}`);
+		this.name = "SessionFileNotFoundError";
+	}
+}
+
+function isFileNotFoundError(error: unknown): boolean {
+	return (
+		error instanceof SessionFileNotFoundError ||
+		(error !== null &&
+			typeof error === "object" &&
+			"code" in error &&
+			(error as { code?: unknown }).code === "ENOENT")
+	);
 }
 
 function parseSessionEntryLine(line: string): FileEntry | null {
@@ -637,7 +669,7 @@ export function findMostRecentSession(sessionDir: string, cwd?: string): string 
 	const resolvedCwd = cwd ? resolvePath(cwd) : undefined;
 	try {
 		const files = readdirSync(resolvedSessionDir)
-			.filter((f) => f.endsWith(".jsonl"))
+			.filter(isSessionTranscriptFile)
 			.map((f) => join(resolvedSessionDir, f))
 			.map((path) => ({ path, header: readSessionHeaderForDiscovery(path) }))
 			.filter(
@@ -821,7 +853,7 @@ async function listSessionsFromDir(
 
 	try {
 		const dirEntries = await readdir(dir);
-		const files = dirEntries.filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f));
+		const files = dirEntries.filter(isSessionTranscriptFile).map((f) => join(dir, f));
 		const total = progressTotal ?? files.length;
 
 		let loaded = 0;
@@ -859,6 +891,12 @@ export class SessionManager {
 	private cwd: string;
 	private persist: boolean;
 	private flushed: boolean = false;
+	private rewritePending: boolean = false;
+	private durableSourceExpectation:
+		| { path: string; kind: "absent" }
+		| { path: string; kind: "empty" }
+		| { path: string; kind: "session"; sessionId: string }
+		| undefined;
 	private fileEntries: FileEntry[] = [];
 	private byId: Map<string, SessionEntry> = new Map();
 	private labelsById: Map<string, string> = new Map();
@@ -872,6 +910,7 @@ export class SessionManager {
 		persist: boolean,
 		newSessionOptions?: NewSessionOptions,
 		preloadedFileEntries?: FileEntry[],
+		expectExisting = false,
 	) {
 		this.cwd = resolvePath(cwd);
 		this.sessionDir = normalizePath(sessionDir);
@@ -881,7 +920,7 @@ export class SessionManager {
 		}
 
 		if (sessionFile) {
-			this._setSessionFile(sessionFile, preloadedFileEntries);
+			this._setSessionFile(sessionFile, preloadedFileEntries, expectExisting);
 		} else {
 			this.newSession(newSessionOptions);
 		}
@@ -892,8 +931,10 @@ export class SessionManager {
 		this._setSessionFile(sessionFile);
 	}
 
-	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
+	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[], expectExisting = false): void {
 		this.sessionFile = resolvePath(sessionFile);
+		this.rewritePending = false;
+		this.durableSourceExpectation = undefined;
 		if (existsSync(this.sessionFile)) {
 			this.fileEntries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
 
@@ -901,27 +942,46 @@ export class SessionManager {
 			// non-empty but did not parse as a pi session, fail without modifying it.
 			if (this.fileEntries.length === 0) {
 				const explicitPath = this.sessionFile;
-				if (statSync(explicitPath).size > 0) {
+				let size: number;
+				try {
+					size = statSync(explicitPath).size;
+				} catch (error) {
+					if (expectExisting && isFileNotFoundError(error)) {
+						throw new SessionFileNotFoundError(explicitPath);
+					}
+					throw error;
+				}
+				if (size > 0) {
 					throw new Error(`Session file is not a valid pi session: ${explicitPath}`);
 				}
 				this.newSession();
 				this.sessionFile = explicitPath;
-				this._rewriteFile();
-				this.flushed = true;
+				this.rewritePending = true;
+				this.durableSourceExpectation = { path: explicitPath, kind: "empty" };
 				return;
 			}
 
 			const header = this.fileEntries.find((e) => e.type === "session") as SessionHeader | undefined;
 			this.sessionId = header?.id ?? createSessionId();
+			if (header) {
+				this.durableSourceExpectation = {
+					path: this.sessionFile,
+					kind: "session",
+					sessionId: header.id,
+				};
+			}
 
 			if (migrateToCurrentVersion(this.fileEntries)) {
-				this._rewriteFile();
+				this.rewritePending = true;
 			}
 
 			this._buildIndex();
 			this.flushed = true;
 		} else {
 			const explicitPath = this.sessionFile;
+			if (expectExisting) {
+				throw new SessionFileNotFoundError(explicitPath);
+			}
 			this.newSession();
 			this.sessionFile = explicitPath; // preserve explicit path from --session flag
 		}
@@ -947,6 +1007,8 @@ export class SessionManager {
 		this.labelTimestampsById.clear();
 		this.leafId = null;
 		this.flushed = false;
+		this.rewritePending = false;
+		this.durableSourceExpectation = undefined;
 
 		if (this.persist) {
 			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
@@ -986,6 +1048,11 @@ export class SessionManager {
 		} finally {
 			closeSync(fd);
 		}
+		this.durableSourceExpectation = {
+			path: this.sessionFile,
+			kind: "session",
+			sessionId: this.sessionId,
+		};
 	}
 
 	isPersisted(): boolean {
@@ -1012,10 +1079,82 @@ export class SessionManager {
 		return this.sessionFile;
 	}
 
+	/**
+	 * Reload the transcript after the caller acquires its durable writer lease
+	 * and before any deferred migration or initialization can write.
+	 */
+	assertDurableSourceUnchanged(): void {
+		const expected = this.durableSourceExpectation;
+		if (!expected) return;
+		if (expected.kind === "absent") {
+			if (existsSync(expected.path)) {
+				throw new Error(`Session target appeared before durable initialization: ${expected.path}`);
+			}
+			return;
+		}
+		if (!existsSync(expected.path)) {
+			throw new Error(`Session changed or was deleted before durable initialization: ${expected.path}`);
+		}
+		if (expected.kind === "empty") {
+			if (statSync(expected.path).size !== 0) {
+				throw new Error(`Session changed before durable initialization: ${expected.path}`);
+			}
+			return;
+		}
+		const currentEntries = loadEntriesFromFile(expected.path);
+		const physicalHeader = currentEntries[0];
+		if (physicalHeader?.type !== "session" || physicalHeader.id !== expected.sessionId) {
+			throw new Error(`Session changed before durable initialization: ${expected.path}`);
+		}
+		this.fileEntries = currentEntries;
+		this.sessionId = physicalHeader.id;
+		this.rewritePending = migrateToCurrentVersion(this.fileEntries);
+		this._buildIndex();
+		this.flushed = true;
+	}
+
+	/**
+	 * Materialize the current session header before the first assistant response.
+	 *
+	 * Normal Pi sessions stay virtual until an assistant message arrives. Durable
+	 * operations need a discoverable session before their acceptance record is
+	 * written, otherwise a crash can leave only an orphaned operation sidecar.
+	 */
+	ensurePersisted(): void {
+		if (!this.persist || !this.sessionFile) return;
+		if (this.rewritePending) {
+			this._rewriteFile();
+			this.rewritePending = false;
+			this.flushed = true;
+			return;
+		}
+		if (this.flushed) return;
+		const fd = openSync(this.sessionFile, "wx");
+		try {
+			for (const entry of this.fileEntries) {
+				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+			}
+		} finally {
+			closeSync(fd);
+		}
+		this.flushed = true;
+		this.durableSourceExpectation = {
+			path: this.sessionFile,
+			kind: "session",
+			sessionId: this.sessionId,
+		};
+	}
+
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
+		if (this.rewritePending && hasAssistant) {
+			this._rewriteFile();
+			this.rewritePending = false;
+			this.flushed = true;
+			return;
+		}
 		if (!hasAssistant) {
 			if (this.flushed) {
 				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
@@ -1166,6 +1305,7 @@ export class SessionManager {
 	 * @param content Message content (string or TextContent/ImageContent array)
 	 * @param display Whether to show in TUI (true = styled display, false = hidden)
 	 * @param details Optional extension-specific metadata (not sent to LLM)
+	 * @param timestamp Optional source message timestamp in milliseconds
 	 * @returns Entry id
 	 */
 	appendCustomMessageEntry<T = unknown>(
@@ -1173,6 +1313,7 @@ export class SessionManager {
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
 		details?: T,
+		timestamp?: number,
 	): string {
 		const entry: CustomMessageEntry<T> = {
 			type: "custom_message",
@@ -1182,7 +1323,7 @@ export class SessionManager {
 			details,
 			id: generateId(this.byId),
 			parentId: this.leafId,
-			timestamp: new Date().toISOString(),
+			timestamp: timestamp === undefined ? new Date().toISOString() : new Date(timestamp).toISOString(),
 		};
 		this._appendEntry(entry);
 		return entry.id;
@@ -1409,7 +1550,7 @@ export class SessionManager {
 	 * Useful for extracting a single conversation path from a branched session.
 	 * Returns the new session file path, or undefined if not persisting.
 	 */
-	createBranchedSession(leafId: string): string | undefined {
+	createBranchedSession(leafId: string, options?: BranchedSessionOptions): string | undefined {
 		const previousSessionFile = this.sessionFile;
 		const path = this.getBranch(leafId);
 		if (path.length === 0) {
@@ -1472,6 +1613,10 @@ export class SessionManager {
 			this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
 			this.sessionId = newSessionId;
 			this.sessionFile = newSessionFile;
+			this.durableSourceExpectation = options?.deferPersistence
+				? { path: newSessionFile, kind: "absent" }
+				: undefined;
+			this.rewritePending = false;
 			this._buildIndex();
 
 			// Only write the file now if it contains an assistant message.
@@ -1480,7 +1625,7 @@ export class SessionManager {
 			// and avoiding the duplicate-header bug when _persist()'s
 			// no-assistant guard later resets flushed to false.
 			const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-			if (hasAssistant) {
+			if (hasAssistant && !options?.deferPersistence) {
 				this._rewriteFile();
 				this.flushed = true;
 			} else {
@@ -1528,13 +1673,37 @@ export class SessionManager {
 	 * @param cwdOverride Optional cwd override instead of the session header cwd.
 	 */
 	static open(path: string, sessionDir?: string, cwdOverride?: string): SessionManager {
+		return SessionManager._open(path, sessionDir, cwdOverride, false);
+	}
+
+	/**
+	 * Open a session that must already exist.
+	 *
+	 * Unlike open(), this never turns a missing path into a new virtual session.
+	 */
+	static openExisting(path: string, sessionDir?: string, cwdOverride?: string): SessionManager {
+		return SessionManager._open(path, sessionDir, cwdOverride, true);
+	}
+
+	private static _open(
+		path: string,
+		sessionDir: string | undefined,
+		cwdOverride: string | undefined,
+		expectExisting: boolean,
+	): SessionManager {
 		const resolvedPath = resolvePath(path);
+		if (expectExisting && !existsSync(resolvedPath)) {
+			throw new SessionFileNotFoundError(resolvedPath);
+		}
 		let header: SessionHeader | null = null;
 		let preloadedFileEntries: FileEntry[] | undefined;
 		if (cwdOverride === undefined && existsSync(resolvedPath)) {
 			try {
 				header = readSessionHeader(resolvedPath);
 			} catch (error) {
+				if (expectExisting && isFileNotFoundError(error)) {
+					throw new SessionFileNotFoundError(resolvedPath);
+				}
 				if (!(error instanceof SessionHeaderScanLimitError)) throw error;
 				// The bounded scan is only a discovery optimization. A full load remains
 				// authoritative for legacy files with very large headers or prefixes.
@@ -1546,7 +1715,7 @@ export class SessionManager {
 		const cwd = cwdOverride ?? (header ? getSessionHeaderCwd(header) : undefined) ?? process.cwd();
 		// If no sessionDir provided, derive from file's parent directory
 		const dir = sessionDir ? normalizePath(sessionDir) : resolve(resolvedPath, "..");
-		return new SessionManager(cwd, dir, resolvedPath, true, undefined, preloadedFileEntries);
+		return new SessionManager(cwd, dir, resolvedPath, true, undefined, preloadedFileEntries, expectExisting);
 	}
 
 	/**
@@ -1559,7 +1728,11 @@ export class SessionManager {
 		const filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd);
 		const mostRecent = findMostRecentSession(dir, filterCwd ? cwd : undefined);
 		if (mostRecent) {
-			return new SessionManager(cwd, dir, mostRecent, true);
+			try {
+				return SessionManager.openExisting(mostRecent, dir, cwd);
+			} catch (error) {
+				if (!isFileNotFoundError(error)) throw error;
+			}
 		}
 		return new SessionManager(cwd, dir, undefined, true);
 	}
@@ -1567,6 +1740,63 @@ export class SessionManager {
 	/** Create an in-memory session (no file persistence) */
 	static inMemory(cwd: string = process.cwd(), options?: NewSessionOptions): SessionManager {
 		return new SessionManager(cwd, "", undefined, false, options);
+	}
+
+	private static _deferredPersistedSession(
+		cwd: string,
+		sessionDir: string,
+		sessionFile: string,
+		entries: FileEntry[],
+		sessionId: string,
+	): SessionManager {
+		if (existsSync(sessionFile)) {
+			throw new Error(`Session target already exists: ${sessionFile}`);
+		}
+		const manager = new SessionManager(cwd, sessionDir, undefined, true, { id: sessionId });
+		manager.sessionId = sessionId;
+		manager.sessionFile = sessionFile;
+		manager.fileEntries = entries;
+		manager.flushed = false;
+		manager.rewritePending = false;
+		manager.durableSourceExpectation = { path: sessionFile, kind: "absent" };
+		manager._buildIndex();
+		return manager;
+	}
+
+	/**
+	 * Load an external transcript into a virtual target in the session directory.
+	 *
+	 * The target is not published until createAgentSession() acquires its durable
+	 * writer lease. Existing targets are never overwritten.
+	 */
+	static importFromJsonl(sourcePath: string, sessionDir: string, cwdOverride?: string): SessionManager {
+		const resolvedSourcePath = resolvePath(sourcePath);
+		if (!existsSync(resolvedSourcePath)) {
+			throw new SessionFileNotFoundError(resolvedSourcePath);
+		}
+		const sourceEntries = loadEntriesFromFile(resolvedSourcePath);
+		const sourceHeader = sourceEntries[0];
+		if (!sourceHeader || sourceHeader.type !== "session") {
+			throw new Error(`Session file is not a valid pi session: ${resolvedSourcePath}`);
+		}
+
+		const dir = normalizePath(sessionDir);
+		const sourceName = basename(resolvedSourcePath);
+		const desiredName = sourceName.endsWith(".jsonl") ? sourceName : `${sourceName}.jsonl`;
+		let destinationPath = join(dir, desiredName);
+		if (resolve(destinationPath) === resolvedSourcePath) {
+			return SessionManager.openExisting(resolvedSourcePath, dir, cwdOverride);
+		}
+		if (existsSync(destinationPath)) {
+			const stem = desiredName.slice(0, -".jsonl".length);
+			do {
+				destinationPath = join(dir, `${stem}-import-${randomUUID()}.jsonl`);
+			} while (existsSync(destinationPath));
+		}
+
+		migrateToCurrentVersion(sourceEntries);
+		const cwd = cwdOverride ?? getSessionHeaderCwd(sourceHeader) ?? process.cwd();
+		return SessionManager._deferredPersistedSession(cwd, dir, destinationPath, sourceEntries, sourceHeader.id);
 	}
 
 	/**
@@ -1580,7 +1810,7 @@ export class SessionManager {
 		sourcePath: string,
 		targetCwd: string,
 		sessionDir?: string,
-		options?: NewSessionOptions,
+		options?: ForkSessionOptions,
 	): SessionManager {
 		const resolvedSourcePath = resolvePath(sourcePath);
 		const resolvedTargetCwd = resolvePath(targetCwd);
@@ -1617,6 +1847,16 @@ export class SessionManager {
 			cwd: resolvedTargetCwd,
 			parentSession: resolvedSourcePath,
 		};
+		const forkedEntries: FileEntry[] = [newHeader, ...sourceEntries.filter((entry) => entry.type !== "session")];
+		if (options?.deferPersistence) {
+			return SessionManager._deferredPersistedSession(
+				resolvedTargetCwd,
+				dir,
+				newSessionFile,
+				forkedEntries,
+				newSessionId,
+			);
+		}
 		writeFileSync(newSessionFile, `${JSON.stringify(newHeader)}\n`, { flag: "wx" });
 
 		// Copy all non-header entries from source
@@ -1679,7 +1919,7 @@ export class SessionManager {
 			const dirFiles: string[][] = [];
 			for (const dir of dirs) {
 				try {
-					const files = (await readdir(dir)).filter((f) => f.endsWith(".jsonl"));
+					const files = (await readdir(dir)).filter(isSessionTranscriptFile);
 					dirFiles.push(files.map((f) => join(dir, f)));
 					totalFiles += files.length;
 				} catch {

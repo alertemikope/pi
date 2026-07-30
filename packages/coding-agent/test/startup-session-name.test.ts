@@ -132,4 +132,29 @@ describe("startup session name", () => {
 		expect(result.stderr).toContain("--name requires a non-empty value");
 		expect(readSessionInfoNames(dirs.sessionFile)).toEqual([]);
 	});
+
+	it("does not append --name before acquiring the session writer lease", async () => {
+		const dirs = setup();
+		const lockPath = `${dirs.sessionFile}.operations.jsonl.lock`;
+		mkdirSync(lockPath);
+		writeFileSync(
+			join(lockPath, "owner.json"),
+			`${JSON.stringify({
+				schema: 1,
+				pid: process.pid,
+				token: "startup-session-name-test",
+				createdAt: Date.now(),
+			})}\n`,
+		);
+
+		const result = await runCli(
+			["--session", dirs.sessionFile, "--name", "Must Not Persist", "--model", "missing-model", "-p", "hi"],
+			dirs,
+		);
+
+		expect(result.code).toBe(1);
+		expect(result.signal).toBeNull();
+		expect(result.stderr).toContain("already open for durable writes");
+		expect(readSessionInfoNames(dirs.sessionFile)).toEqual([]);
+	});
 });
