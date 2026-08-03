@@ -88,6 +88,162 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	"ResourceExhausted",
 ]);
 
+const AUTH_ERROR_PATTERN = buildProviderErrorPattern([
+	"401",
+	"unauthorized",
+	"invalid.?api.?key",
+	"authentication.?failed",
+	"invalid.?token",
+	"token.?expired",
+]);
+const PERMISSION_ERROR_PATTERN = buildProviderErrorPattern(["403", "forbidden", "permission.?denied"]);
+const CONTEXT_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
+	"context.?length",
+	"context.?window",
+	"maximum.?context",
+	"too many tokens",
+	"max_tokens",
+]);
+const NETWORK_ERROR_PATTERN = buildProviderErrorPattern([
+	"network.?error",
+	"connection.?error",
+	"connection.?refused",
+	"connection.?lost",
+	"other side closed",
+	"fetch failed",
+	"getaddrinfo",
+	"ENOTFOUND",
+	"EAI_AGAIN",
+	"upstream.?connect",
+	"reset before headers",
+	"socket hang up",
+	"socket connection was closed",
+	"timed? out",
+	"timeout",
+	"terminated",
+	"websocket.?closed",
+	"websocket.?error",
+	"ended without",
+	"stream ended before",
+	"http2 request did not get a response",
+]);
+const RATE_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
+	"rate.?limit",
+	"too many requests",
+	"429",
+	"ResourceExhausted",
+]);
+const CAPACITY_ERROR_PATTERN = buildProviderErrorPattern([
+	"overloaded",
+	"500",
+	"502",
+	"503",
+	"504",
+	"524",
+	"service.?unavailable",
+	"server.?error",
+	"internal.?error",
+	"provider.?returned.?error",
+]);
+const INVALID_INPUT_ERROR_PATTERN = buildProviderErrorPattern(["400", "bad.?request", "invalid.?request"]);
+
+export type FailureKind =
+	| "auth"
+	| "rate_limit"
+	| "capacity"
+	| "network"
+	| "quota"
+	| "invalid_input"
+	| "context_limit"
+	| "permission"
+	| "cancelled"
+	| "unknown";
+
+export type FailureRecoveryAction =
+	| "retry"
+	| "wait"
+	| "reauthenticate"
+	| "compact"
+	| "change_model"
+	| "fix_input"
+	| "abort";
+
+export interface FailureDisposition {
+	kind: FailureKind;
+	retryable: boolean;
+	retryAfterMs?: number;
+	recovery: { action: FailureRecoveryAction; hint?: string };
+}
+
+function diagnosticNumber(message: AssistantMessage, key: string): number | undefined {
+	for (const diagnostic of message.diagnostics ?? []) {
+		const value = diagnostic.details?.[key];
+		if (typeof value === "number" && Number.isFinite(value)) return value;
+	}
+	return undefined;
+}
+
+function failureText(message: AssistantMessage): string {
+	return [
+		message.errorMessage,
+		message.rawStopReason,
+		...(message.diagnostics ?? []).flatMap((diagnostic) => [
+			diagnostic.error?.message,
+			diagnostic.error?.code === undefined ? undefined : String(diagnostic.error.code),
+		]),
+	]
+		.filter((value): value is string => typeof value === "string" && value.length > 0)
+		.join("\n");
+}
+
+/** Pure recovery classification for an assistant failure. */
+export function classifyAssistantFailure(message: AssistantMessage): FailureDisposition {
+	if (message.stopReason === "aborted") {
+		return { kind: "cancelled", retryable: false, recovery: { action: "abort" } };
+	}
+	const text = failureText(message);
+	if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(text)) {
+		return {
+			kind: "quota",
+			retryable: false,
+			recovery: { action: "abort", hint: "Check provider quota or billing before retrying." },
+		};
+	}
+	if (AUTH_ERROR_PATTERN.test(text)) {
+		return { kind: "auth", retryable: false, recovery: { action: "reauthenticate" } };
+	}
+	if (PERMISSION_ERROR_PATTERN.test(text)) {
+		return { kind: "permission", retryable: false, recovery: { action: "abort" } };
+	}
+	if (CONTEXT_LIMIT_ERROR_PATTERN.test(text)) {
+		return { kind: "context_limit", retryable: false, recovery: { action: "compact" } };
+	}
+	if (RATE_LIMIT_ERROR_PATTERN.test(text)) {
+		const retryAfterMs = diagnosticNumber(message, "retryAfterMs");
+		return {
+			kind: "rate_limit",
+			retryable: true,
+			...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+			recovery: { action: "wait" },
+		};
+	}
+	if (NETWORK_ERROR_PATTERN.test(text)) {
+		return { kind: "network", retryable: true, recovery: { action: "retry" } };
+	}
+	if (CAPACITY_ERROR_PATTERN.test(text)) {
+		return { kind: "capacity", retryable: true, recovery: { action: "change_model" } };
+	}
+	if (INVALID_INPUT_ERROR_PATTERN.test(text)) {
+		return { kind: "invalid_input", retryable: false, recovery: { action: "fix_input" } };
+	}
+	const retryable = message.stopReason === "error" && RETRYABLE_PROVIDER_ERROR_PATTERN.test(text);
+	return {
+		kind: "unknown",
+		retryable,
+		recovery: { action: retryable ? "retry" : "abort" },
+	};
+}
+
 /**
  * Retry policy: bounded attempts with exponential backoff (`baseDelayMs * 2^(attempt-1)`).
  * Matches `settings.retry` (`enabled`, `maxRetries`, `baseDelayMs`) in coding-agent; kept
@@ -220,8 +376,6 @@ export async function retryAssistantCall(
  * before restarting the assistant turn.
  */
 export function isRetryableAssistantError(message: AssistantMessage): boolean {
-	if (message.stopReason !== "error" || !message.errorMessage) return false;
-	const errorMessage = message.errorMessage;
-	if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(errorMessage)) return false;
-	return RETRYABLE_PROVIDER_ERROR_PATTERN.test(errorMessage);
+	if (message.stopReason !== "error") return false;
+	return classifyAssistantFailure(message).retryable;
 }

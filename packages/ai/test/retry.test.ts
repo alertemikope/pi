@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { fauxAssistantMessage } from "../src/providers/faux.ts";
-import { isRetryableAssistantError, type RetryPolicy, retryAssistantCall } from "../src/utils/retry.ts";
+import {
+	classifyAssistantFailure,
+	isRetryableAssistantError,
+	type RetryPolicy,
+	retryAssistantCall,
+} from "../src/utils/retry.ts";
 
 const openAIExplicitRetryMessage =
 	"An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. Please include the request ID req_******** in your message.";
@@ -63,6 +68,34 @@ describe("provider retry classification", () => {
 				fauxAssistantMessage("", { stopReason: "error", errorMessage: "429 quota exceeded" }),
 			),
 		).toBe(false);
+	});
+
+	it("returns actionable structured dispositions", () => {
+		expect(
+			classifyAssistantFailure(
+				fauxAssistantMessage("", { stopReason: "error", errorMessage: "401 invalid API key" }),
+			),
+		).toEqual({ kind: "auth", retryable: false, recovery: { action: "reauthenticate" } });
+		expect(
+			classifyAssistantFailure(
+				fauxAssistantMessage("", { stopReason: "error", errorMessage: "context length exceeded" }),
+			),
+		).toEqual({ kind: "context_limit", retryable: false, recovery: { action: "compact" } });
+		expect(
+			classifyAssistantFailure(fauxAssistantMessage("", { stopReason: "error", errorMessage: "503 overloaded" })),
+		).toEqual({ kind: "capacity", retryable: true, recovery: { action: "change_model" } });
+	});
+
+	it("preserves provider retry timing from diagnostics", () => {
+		const message = fauxAssistantMessage("", { stopReason: "error", errorMessage: "429 rate limited" });
+		message.diagnostics = [{ type: "provider", timestamp: 1, details: { retryAfterMs: 2500 } }];
+
+		expect(classifyAssistantFailure(message)).toEqual({
+			kind: "rate_limit",
+			retryable: true,
+			retryAfterMs: 2500,
+			recovery: { action: "wait" },
+		});
 	});
 
 	it("classifies assistant error messages", () => {
