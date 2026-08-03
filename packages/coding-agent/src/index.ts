@@ -193,6 +193,8 @@ export {
 } from "./core/model-resolver.ts";
 export {
 	type CreateModelRuntimeOptions,
+	CredentialSynchronizationError,
+	type CredentialSynchronizationOperation,
 	ModelRuntime,
 	type ModelRuntimeAuthOverrides,
 } from "./core/model-runtime.ts";
