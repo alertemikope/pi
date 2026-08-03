@@ -1,4 +1,4 @@
-import type { Usage } from "@earendil-works/pi-ai";
+import type { StopReason, Usage } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "../../../types.ts";
 import type { Session } from "./session.ts";
 
@@ -124,20 +124,22 @@ export interface OperationFinishedRecord extends RecordBase {
 
 export type CompactionReason = "manual" | "threshold" | "overflow";
 
-export type TaskAttemptRecord = RecordBase &
+export type StepAttemptRecord = RecordBase &
 	(
 		| {
-				type: "task_attempt";
+				type: "step_attempt";
 				runId: string;
-				task: "step" | "branch_summary";
+				step: "assistant" | "branch_summary";
 				attempt: number;
+				resultEntryId: string;
 				compactionReason?: never;
 		  }
 		| {
-				type: "task_attempt";
+				type: "step_attempt";
 				runId: string;
-				task: "compaction";
+				step: "compaction";
 				attempt: number;
+				resultEntryId: string;
 				/** Persists why compaction summary generation started so recovery resumes the same work. */
 				compactionReason: CompactionReason;
 		  }
@@ -183,19 +185,31 @@ export interface WriteDeferredRecord extends RecordBase {
 	target: ProvisionedEntry;
 }
 
+export type UsageRecord = RecordBase & { type: "usage"; usage: Usage } & (
+		| {
+				cause: "assistant" | "compaction" | "branch_summary" | "deferred_fetch";
+				runId: string;
+				entryId: string;
+				attempt: number;
+				stopReason: StopReason;
+		  }
+		| { cause: "tool"; runId: string; entryId: string; toolCallId: string }
+		| { cause: "hook"; runId: string; entryId: string }
+		| { cause: "adjustment"; runId?: string; entryId?: string; details?: JsonValue }
+	);
+
 export type LaneRecord =
 	| OperationStartedRecord
 	| AbortRequestedRecord
 	| OperationFinishedRecord
-	| TaskAttemptRecord
+	| StepAttemptRecord
 	| ToolStartedRecord
 	| QueueEnqueuedRecord
 	| QueueCancelledRecord
-	| WriteDeferredRecord;
-export type NewRecord = LaneRecord extends infer TRecord
-	? TRecord extends LaneRecord
-		? Omit<TRecord, "seq" | "timestamp">
-		: never
+	| WriteDeferredRecord
+	| UsageRecord;
+export type NewRecord<TRecord extends LaneRecord = LaneRecord> = TRecord extends LaneRecord
+	? Omit<TRecord, "seq" | "timestamp">
 	: never;
 
 export type EntryOrder = "newestFirst" | "oldestFirst";
@@ -233,13 +247,7 @@ export interface SessionMetadata {
 	parentSessionId?: string;
 }
 
-export interface SessionStats {
-	messageCount: number;
-	cachedTokens: number;
-	uncachedTokens: number;
-	totalTokens: number;
-	costTotal: number;
-}
+export type SessionStats = Usage;
 
 export interface LanePointer {
 	lane: string;
@@ -268,13 +276,16 @@ export interface SessionStorage<TMetadata extends SessionMetadata = SessionMetad
 
 	// Entries and Records
 	appendEntry<TEntry extends Entry>(entry: ProvisionedEntry<TEntry>, lane: string): Promise<TEntry>;
-	appendRecord(record: NewRecord): Promise<LaneRecord>;
+	appendRecord<TRecord extends LaneRecord>(record: NewRecord<TRecord>): Promise<TRecord>;
 
 	// Reads
 	getEntry(id: string): Promise<Entry | undefined>;
 	findEntries(query?: EntryQuery): Promise<Entry[]>;
 	/** start is mandatory here; defaulting to a lane's leaf is view sugar. */
 	findEntriesOnBranch(query: EntryQuery & BranchBounds & { start: string }): Promise<Entry[]>;
+	findRecords<K extends LaneRecord["type"]>(
+		query: RecordQuery & { type: K },
+	): Promise<Extract<LaneRecord, { type: K }>[]>;
 	findRecords(query?: RecordQuery): Promise<LaneRecord[]>;
 	getLog(options?: { afterSeq?: number; limit?: number }): Promise<LogItem[]>;
 

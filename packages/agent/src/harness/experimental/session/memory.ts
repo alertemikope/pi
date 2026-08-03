@@ -1,4 +1,4 @@
-import { uuidv7 } from "@earendil-works/pi-ai";
+import { type Usage, uuidv7 } from "@earendil-works/pi-ai";
 import { Session } from "./session.ts";
 import {
 	type BranchBounds,
@@ -38,9 +38,39 @@ function provisionEntry<TEntry extends Entry>(
 	return { ...newEntry, parentId, seq, timestamp: Date.now() } as unknown as TEntry;
 }
 
-function provisionRecord(newRecord: NewRecord, seq: number): LaneRecord {
+function provisionRecord<TRecord extends LaneRecord>(newRecord: NewRecord<TRecord>, seq: number): TRecord {
 	// Object spread does not preserve the correlation between a discriminant and the rest of a union member.
-	return { ...newRecord, seq, timestamp: Date.now() } as LaneRecord;
+	return { ...newRecord, seq, timestamp: Date.now() } as unknown as TRecord;
+}
+
+function createEmptyUsage(): Usage {
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
+function addUsage(target: Usage, usage: Usage): void {
+	target.input += usage.input;
+	target.output += usage.output;
+	target.cacheRead += usage.cacheRead;
+	target.cacheWrite += usage.cacheWrite;
+	target.totalTokens += usage.totalTokens;
+	target.cost.input += usage.cost.input;
+	target.cost.output += usage.cost.output;
+	target.cost.cacheRead += usage.cost.cacheRead;
+	target.cost.cacheWrite += usage.cost.cacheWrite;
+	target.cost.total += usage.cost.total;
+	if (usage.cacheWrite1h !== undefined || target.cacheWrite1h !== undefined) {
+		target.cacheWrite1h = (target.cacheWrite1h ?? 0) + (usage.cacheWrite1h ?? 0);
+	}
+	if (usage.reasoning !== undefined || target.reasoning !== undefined) {
+		target.reasoning = (target.reasoning ?? 0) + (usage.reasoning ?? 0);
+	}
 }
 
 export class InMemorySessionStorage implements SessionStorage {
@@ -53,6 +83,7 @@ export class InMemorySessionStorage implements SessionStorage {
 	private readonly records: LaneRecord[] = [];
 	private readonly lanes = new Map<string, string | null>([["main", null]]);
 	private readonly log: LogItem[] = [];
+	private readonly usage = createEmptyUsage();
 	private name: string | undefined;
 	private readonly labels = new Map<string, string>();
 
@@ -141,7 +172,7 @@ export class InMemorySessionStorage implements SessionStorage {
 		return structuredClone(entry);
 	}
 
-	async appendRecord(newRecord: NewRecord): Promise<LaneRecord> {
+	async appendRecord<TRecord extends LaneRecord>(newRecord: NewRecord<TRecord>): Promise<TRecord> {
 		this.requireLane(newRecord.lane);
 		this.validateUnusedId(newRecord.id);
 		const clonedRecord = structuredClone(newRecord);
@@ -149,6 +180,7 @@ export class InMemorySessionStorage implements SessionStorage {
 		this.usedIds.add(record.id);
 		this.records.push(record);
 		this.log.push({ kind: "record", seq: record.seq, record });
+		if (record.type === "usage") addUsage(this.usage, record.usage);
 		return structuredClone(record);
 	}
 
@@ -184,6 +216,10 @@ export class InMemorySessionStorage implements SessionStorage {
 		return structuredClone(results);
 	}
 
+	async findRecords<K extends LaneRecord["type"]>(
+		query: RecordQuery & { type: K },
+	): Promise<Extract<LaneRecord, { type: K }>[]>;
+	async findRecords(query?: RecordQuery): Promise<LaneRecord[]>;
 	async findRecords(query: RecordQuery = {}): Promise<LaneRecord[]> {
 		const results: LaneRecord[] = [];
 		for (const record of ordered(this.records, query.order)) {
@@ -225,30 +261,7 @@ export class InMemorySessionStorage implements SessionStorage {
 	}
 
 	async getStats(): Promise<SessionStats> {
-		const stats: SessionStats = {
-			messageCount: 0,
-			cachedTokens: 0,
-			uncachedTokens: 0,
-			totalTokens: 0,
-			costTotal: 0,
-		};
-		for (const entry of this.entries) {
-			if (entry.type === "message") stats.messageCount += 1;
-			const usage =
-				entry.type === "message"
-					? entry.message.role === "assistant"
-						? entry.message.usage
-						: undefined
-					: entry.type === "compaction" || entry.type === "branch_summary"
-						? entry.usage
-						: undefined;
-			if (!usage) continue;
-			stats.cachedTokens += usage.cacheRead;
-			stats.uncachedTokens += usage.input + usage.cacheWrite;
-			stats.totalTokens += usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
-			stats.costTotal += usage.cost.total;
-		}
-		return stats;
+		return structuredClone(this.usage);
 	}
 
 	private nextSequence(): number {
