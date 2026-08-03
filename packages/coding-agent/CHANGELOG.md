@@ -75,6 +75,10 @@
 - Added built-in Baseten provider support with `BASETEN_API_KEY` authentication and `zai-org/GLM-5.2` as the default model.
 - Added `CredentialSynchronizationError` for credential changes that commit successfully but fail to synchronize local model state.
 - Added chainable `pi.registerMarkdownTransformer()` hooks for display-only transformation of user and assistant Markdown.
+- Added durable host verification gates with one hidden corrective continuation, operation identities on extension lifecycle events, and host-attested reruns before settlement.
+- Added explicit durable journal sequences, compare-and-set consumer offsets, process-exit diagnostics, and a real `SIGKILL` crash matrix.
+- Added private SHA-256 CAS storage and final provider-payload prefix diagnostics after extension transformations.
+- Added a fail-closed Git operation snapshot extension based on `git stash create` and private `refs/pi/operation-snapshots/*` refs.
 - Added an experimental fullscreen UI mode, selectable through `--ui-mode fullscreen` or `/settings` ([#7304](https://github.com/earendil-works/pi/issues/7304)).
 - Added runtime switching between regular and fullscreen UI modes through `/settings`.
 - Added a sticky editor, status, widget, and footer dock to fullscreen mode while keeping the transcript independently scrollable.

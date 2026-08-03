@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { unlink } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import * as os from "node:os";
 import {
 	type Component,
@@ -13,7 +13,11 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
-import { acquireDurableOperationLease, type DurableOperationLease } from "../../../core/durable-operations.ts";
+import {
+	acquireDurableOperationLease,
+	type DurableOperationLease,
+	getDurableOperationArtifactPaths,
+} from "../../../core/durable-operations.ts";
 import { KeybindingsManager } from "../../../core/keybindings.ts";
 import { type SessionInfo, type SessionListProgress, SessionManager } from "../../../core/session-manager.ts";
 import { canonicalizePath as _canonicalizePath } from "../../../utils/paths.ts";
@@ -659,7 +663,7 @@ export function renameInactiveSessionFile(sessionPath: string, nextName: string)
 /**
  * Delete a session file, trying the `trash` CLI first, then falling back to unlink
  */
-async function deleteSessionFile(
+export async function deleteSessionFile(
 	sessionPath: string,
 ): Promise<{ ok: boolean; method: "trash" | "unlink"; error?: string }> {
 	const durableOperationsPath = `${sessionPath}.operations.jsonl`;
@@ -675,7 +679,10 @@ async function deleteSessionFile(
 	}
 
 	try {
-		const targets = existsSync(durableOperationsPath) ? [sessionPath, durableOperationsPath] : [sessionPath];
+		const artifacts = getDurableOperationArtifactPaths(durableOperationsPath);
+		const targets = [sessionPath, artifacts.journalPath, artifacts.consumersPath, artifacts.blobsPath].filter(
+			(target) => existsSync(target),
+		);
 
 		// Try `trash` first (if installed)
 		const trashArgs = targets.some((target) => target.startsWith("-")) ? ["--", ...targets] : targets;
@@ -694,17 +701,17 @@ async function deleteSessionFile(
 			return `trash: ${parts.join(" · ").slice(0, 200)}`;
 		};
 
-		// Only report success once both the transcript and its exact sidecar are gone.
+		// Only report success once the transcript and every exact durable artifact are gone.
 		if (targets.every((target) => !existsSync(target))) {
 			return { ok: true, method: "trash" };
 		}
 
 		// Fallback to permanent deletion
 		try {
-			// Delete the sidecar first so a partial failure cannot orphan its durable data.
-			for (const target of [durableOperationsPath, sessionPath]) {
+			// Delete durable artifacts first so a partial failure cannot orphan their transcript ownership.
+			for (const target of [artifacts.blobsPath, artifacts.consumersPath, artifacts.journalPath, sessionPath]) {
 				if (targets.includes(target) && existsSync(target)) {
-					await unlink(target);
+					await rm(target, { recursive: true });
 				}
 			}
 			return { ok: true, method: "unlink" };

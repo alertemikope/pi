@@ -181,6 +181,53 @@ describe("durable AgentSession integration", () => {
 		}
 	});
 
+	it("records the final provider payload after extension transformations", async () => {
+		let releaseResponse: (() => void) | undefined;
+		let markStarted: (() => void) | undefined;
+		const responseGate = new Promise<void>((resolve) => {
+			releaseResponse = resolve;
+		});
+		const responseStarted = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const harness = await createHarness({
+			persistentSession: true,
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_provider_request", (event) => ({
+						...(event.payload as Record<string, unknown>),
+						finalExtensionMarker: "present",
+					}));
+				},
+			],
+		});
+
+		try {
+			harness.setResponses([
+				async () => {
+					markStarted?.();
+					await responseGate;
+					return fauxAssistantMessage("done");
+				},
+			]);
+			const prompt = harness.session.prompt("capture the final payload");
+			await responseStarted;
+			await harness.session.agent.onPayload?.({ original: true }, harness.getModel());
+			releaseResponse?.();
+			await prompt;
+
+			const journal = durableJournal(harness.session);
+			const diagnostic = journal.list().at(-1)?.providerPayloads[0];
+			expect(diagnostic).toMatchObject({ invalidationReason: "first_request", commonPrefixBytes: 0 });
+			expect(journal.readProviderPayload(diagnostic!.payload)).toMatchObject({
+				finalExtensionMarker: "present",
+			});
+		} finally {
+			releaseResponse?.();
+			harness.cleanup();
+		}
+	});
+
 	it("records host verification while a durable operation is active", async () => {
 		const harness = await createHarness({ persistentSession: true });
 		let releaseResponse: (() => void) | undefined;

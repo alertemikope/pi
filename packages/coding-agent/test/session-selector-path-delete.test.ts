@@ -3,10 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setKeybindings } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { DurableOperationJournal } from "../src/core/durable-operations.ts";
+import { DurableOperationJournal, getDurableOperationArtifactPaths } from "../src/core/durable-operations.ts";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type { SessionInfo } from "../src/core/session-manager.ts";
-import { SessionSelectorComponent } from "../src/modes/interactive/components/session-selector.ts";
+import { deleteSessionFile, SessionSelectorComponent } from "../src/modes/interactive/components/session-selector.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
 type Deferred<T> = {
@@ -353,41 +353,37 @@ describe("session selector path/delete interactions", () => {
 		expect(errorMessage).toBe("Cannot delete the currently active session");
 	});
 
-	it("deletes the exact durable operation sidecar with the session", async () => {
+	it("deletes every exact durable operation artifact with the session", async () => {
 		const baseDir = mkdtempSync(join(tmpdir(), "pi-session-selector-delete-"));
 		tempDirs.push(baseDir);
 		const sessionPath = join(baseDir, "session.jsonl");
 		const sidecarPath = `${sessionPath}.operations.jsonl`;
 		writeFileSync(sessionPath, "session\n");
-		writeFileSync(sidecarPath, "durable operations\n");
-		const sessions = [makeSession({ id: "session", path: sessionPath })];
-
-		const selector = new SessionSelectorComponent(
-			async () => sessions,
-			async () => sessions,
-			() => {},
-			() => {},
-			() => {},
-			() => {},
-			{ keybindings },
-		);
-		await flushPromises();
-
+		const journal = new DurableOperationJournal(sidecarPath, "session");
+		const operation = journal.begin("persist artifacts");
+		journal.recordProviderPayload(operation, {
+			provider: "provider",
+			model: "model",
+			api: "openai-responses",
+			payload: { private: "payload" },
+		});
+		journal.finish(operation, "completed");
+		const lastSequence = journal.getLog().at(-1)!.seq;
+		journal.advanceConsumerOffset("test-consumer", 0, lastSequence);
+		journal.close();
+		const artifacts = getDurableOperationArtifactPaths(sidecarPath);
 		const previousPath = process.env.PATH;
 		process.env.PATH = "";
 		try {
-			const list = selector.getSessionList();
-			list.handleInput(CTRL_D);
-			list.handleInput("\r");
-			for (let attempt = 0; attempt < 20 && (existsSync(sessionPath) || existsSync(sidecarPath)); attempt++) {
-				await flushPromises();
-			}
+			expect(await deleteSessionFile(sessionPath)).toMatchObject({ ok: true, method: "unlink" });
 		} finally {
 			process.env.PATH = previousPath;
 		}
 
 		expect(existsSync(sessionPath)).toBe(false);
-		expect(existsSync(sidecarPath)).toBe(false);
+		expect(existsSync(artifacts.journalPath)).toBe(false);
+		expect(existsSync(artifacts.consumersPath)).toBe(false);
+		expect(existsSync(artifacts.blobsPath)).toBe(false);
 	});
 
 	it("preserves the session and sidecar while the durable journal is locked", async () => {

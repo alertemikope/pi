@@ -13,12 +13,62 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import {
+	type ContentAddressedBlobRef,
+	ContentAddressedStore,
+	isContentAddressedBlobRef,
+} from "./content-addressed-store.ts";
 import { isVerificationReceipt, type VerificationReceipt } from "./verification.ts";
 
 export type DurableOperationStatus = "accepted" | "running" | "suspended" | "completed" | "failed" | "aborted";
 export type DurableOperationOutcome = Extract<DurableOperationStatus, "completed" | "failed" | "aborted">;
 export type DurableReplayPolicy = "safe" | "never";
 export type DurableEffectStatus = "reserved" | "dispatched" | "completed" | "failed" | "unresolved";
+
+export type ProviderPayloadInvalidationReason =
+	| "first_request"
+	| "none"
+	| "provider_changed"
+	| "model_changed"
+	| "api_changed"
+	| "payload_shrank"
+	| "prefix_changed";
+
+export interface ProviderPayloadDiagnostic {
+	seq: number;
+	provider: string;
+	model: string;
+	api: string;
+	payload: ContentAddressedBlobRef;
+	previousPayload?: ContentAddressedBlobRef;
+	commonPrefixBytes: number;
+	deltaBytes: number;
+	stablePrefixRatio: number;
+	invalidationReason: ProviderPayloadInvalidationReason;
+}
+
+export interface DurableJournalRecord {
+	seq: number;
+	at: number;
+	operationId: string;
+	sessionId: string;
+	type: string;
+	data: unknown;
+}
+
+export interface DurableProcessIdentity {
+	pid: number;
+	instanceId: string;
+	startedAt: number;
+}
+
+export interface DurableProcessExitDiagnostic {
+	seq: number;
+	kind: "unclean_exit";
+	previousProcess?: DurableProcessIdentity;
+	detectedBy: DurableProcessIdentity;
+	lastRecordSeq: number;
+}
 
 export interface DurableOperationHandle {
 	id: string;
@@ -58,19 +108,28 @@ export interface DurableOperationSnapshot {
 	lastCheckpoint?: { kind: string; data?: unknown; at: number };
 	effects: DurableEffectSnapshot[];
 	verificationReceipts: VerificationReceipt[];
+	providerPayloads: ProviderPayloadDiagnostic[];
+	processExits: DurableProcessExitDiagnostic[];
+	ownerProcess?: DurableProcessIdentity;
 	prepared?: DurablePreparedInput;
 	error?: string;
 }
 
 interface DurableRecordBase {
 	schema: 1;
+	seq: number;
 	at: number;
 	operationId: string;
 	sessionId: string;
 }
 
 type DurableRecord =
-	| (DurableRecordBase & { type: "operation_started"; prompt: string; prepared?: DurablePreparedInput })
+	| (DurableRecordBase & {
+			type: "operation_started";
+			prompt: string;
+			prepared?: DurablePreparedInput;
+			process?: DurableProcessIdentity;
+	  })
 	| (DurableRecordBase & { type: "prepared_updated"; prepared: DurablePreparedInput })
 	| (DurableRecordBase & { type: "task_attempt"; attempt: number; recovered: boolean })
 	| (DurableRecordBase & { type: "checkpoint"; kind: string; data?: unknown })
@@ -119,6 +178,14 @@ type DurableRecord =
 	| (DurableRecordBase & { type: "tool_reconciled"; key: string })
 	| (DurableRecordBase & { type: "tool_reused"; key: string; sourceKey: string })
 	| (DurableRecordBase & { type: "verification_recorded"; receipt: VerificationReceipt })
+	| (DurableRecordBase & {
+			type: "provider_payload_recorded";
+			diagnostic: Omit<ProviderPayloadDiagnostic, "seq">;
+	  })
+	| (DurableRecordBase & {
+			type: "process_exit_recorded";
+			diagnostic: Omit<DurableProcessExitDiagnostic, "seq">;
+	  })
 	| (DurableRecordBase & { type: "operation_suspended"; error: string })
 	| (DurableRecordBase & { type: "resume_requested"; attempt: number })
 	| (DurableRecordBase & { type: "abort_requested"; reason: string })
@@ -128,7 +195,7 @@ type DurableRecord =
 			error?: string;
 	  });
 
-type WithoutRecordEnvelope<T> = T extends unknown ? Omit<T, "schema" | "at"> : never;
+type WithoutRecordEnvelope<T> = T extends unknown ? Omit<T, "schema" | "seq" | "at"> : never;
 type NewDurableRecord = WithoutRecordEnvelope<DurableRecord>;
 
 export type DurableEffectClaim =
@@ -313,6 +380,19 @@ export function acquireDurableOperationLease(journalPath: string): DurableOperat
 	return new TransferableDurableOperationLease(resolvedJournalPath);
 }
 
+export function getDurableOperationArtifactPaths(journalPath: string): {
+	journalPath: string;
+	blobsPath: string;
+	consumersPath: string;
+} {
+	const resolvedJournalPath = resolve(journalPath);
+	return {
+		journalPath: resolvedJournalPath,
+		blobsPath: `${resolvedJournalPath}.blobs`,
+		consumersPath: `${resolvedJournalPath}.consumers.json`,
+	};
+}
+
 function canonicalize(value: unknown, seen = new WeakSet<object>()): unknown {
 	if (Array.isArray(value)) {
 		if (seen.has(value)) return { circular: true };
@@ -359,6 +439,35 @@ function hash(value: string): string {
 	return createHash("sha256").update(value).digest("hex");
 }
 
+function commonPrefixBytes(left: Uint8Array, right: Uint8Array): number {
+	const limit = Math.min(left.length, right.length);
+	let index = 0;
+	while (index < limit && left[index] === right[index]) index += 1;
+	return index;
+}
+
+interface DurableConsumerOffsetFile {
+	schema: 1;
+	sessionId: string;
+	offsets: Record<string, number>;
+}
+
+function isConsumerOffsetFile(value: unknown): value is DurableConsumerOffsetFile {
+	if (!value || typeof value !== "object") return false;
+	const file = value as Record<string, unknown>;
+	if (file.schema !== 1 || typeof file.sessionId !== "string" || !file.offsets || typeof file.offsets !== "object") {
+		return false;
+	}
+	return Object.entries(file.offsets).every(
+		([consumerId, offset]) =>
+			consumerId.length > 0 &&
+			consumerId.length <= 128 &&
+			typeof offset === "number" &&
+			Number.isSafeInteger(offset) &&
+			offset >= 0,
+	);
+}
+
 function cloneEffect(effect: DurableEffectSnapshot): DurableEffectSnapshot {
 	return {
 		...effect,
@@ -383,6 +492,9 @@ function cloneSnapshot(snapshot: DurableOperationSnapshot): DurableOperationSnap
 			: undefined,
 		effects: snapshot.effects.map((effect) => cloneEffect(effect)),
 		verificationReceipts: cloneJson(snapshot.verificationReceipts) as VerificationReceipt[],
+		providerPayloads: cloneJson(snapshot.providerPayloads) as ProviderPayloadDiagnostic[],
+		processExits: cloneJson(snapshot.processExits) as DurableProcessExitDiagnostic[],
+		ownerProcess: snapshot.ownerProcess ? { ...snapshot.ownerProcess } : undefined,
 	};
 }
 
@@ -393,6 +505,8 @@ function isOptionalString(value: unknown): boolean {
 function hasRecordEnvelope(record: Record<string, unknown>): boolean {
 	return (
 		record.schema === 1 &&
+		(record.seq === undefined ||
+			(typeof record.seq === "number" && Number.isSafeInteger(record.seq) && record.seq > 0)) &&
 		typeof record.type === "string" &&
 		typeof record.at === "number" &&
 		Number.isFinite(record.at) &&
@@ -400,6 +514,74 @@ function hasRecordEnvelope(record: Record<string, unknown>): boolean {
 		record.operationId.length > 0 &&
 		typeof record.sessionId === "string" &&
 		record.sessionId.length > 0
+	);
+}
+
+function isProviderPayloadDiagnostic(value: unknown): value is Omit<ProviderPayloadDiagnostic, "seq"> {
+	if (!value || typeof value !== "object") return false;
+	const diagnostic = value as Record<string, unknown>;
+	return (
+		typeof diagnostic.provider === "string" &&
+		diagnostic.provider.length > 0 &&
+		typeof diagnostic.model === "string" &&
+		diagnostic.model.length > 0 &&
+		typeof diagnostic.api === "string" &&
+		diagnostic.api.length > 0 &&
+		isContentAddressedBlobRef(diagnostic.payload) &&
+		(diagnostic.previousPayload === undefined || isContentAddressedBlobRef(diagnostic.previousPayload)) &&
+		typeof diagnostic.commonPrefixBytes === "number" &&
+		Number.isSafeInteger(diagnostic.commonPrefixBytes) &&
+		diagnostic.commonPrefixBytes >= 0 &&
+		typeof diagnostic.deltaBytes === "number" &&
+		Number.isSafeInteger(diagnostic.deltaBytes) &&
+		diagnostic.deltaBytes >= 0 &&
+		typeof diagnostic.stablePrefixRatio === "number" &&
+		Number.isFinite(diagnostic.stablePrefixRatio) &&
+		diagnostic.stablePrefixRatio >= 0 &&
+		diagnostic.stablePrefixRatio <= 1 &&
+		(diagnostic.invalidationReason === "first_request" ||
+			diagnostic.invalidationReason === "none" ||
+			diagnostic.invalidationReason === "provider_changed" ||
+			diagnostic.invalidationReason === "model_changed" ||
+			diagnostic.invalidationReason === "api_changed" ||
+			diagnostic.invalidationReason === "payload_shrank" ||
+			diagnostic.invalidationReason === "prefix_changed")
+	);
+}
+
+function isDurableProcessIdentity(value: unknown): value is DurableProcessIdentity {
+	return (
+		!!value &&
+		typeof value === "object" &&
+		"pid" in value &&
+		typeof value.pid === "number" &&
+		Number.isSafeInteger(value.pid) &&
+		value.pid > 0 &&
+		"instanceId" in value &&
+		typeof value.instanceId === "string" &&
+		value.instanceId.length > 0 &&
+		"startedAt" in value &&
+		typeof value.startedAt === "number" &&
+		Number.isFinite(value.startedAt) &&
+		value.startedAt >= 0
+	);
+}
+
+function isProcessExitDiagnostic(value: unknown): value is Omit<DurableProcessExitDiagnostic, "seq"> {
+	return (
+		!!value &&
+		typeof value === "object" &&
+		"kind" in value &&
+		value.kind === "unclean_exit" &&
+		(!("previousProcess" in value) ||
+			value.previousProcess === undefined ||
+			isDurableProcessIdentity(value.previousProcess)) &&
+		"detectedBy" in value &&
+		isDurableProcessIdentity(value.detectedBy) &&
+		"lastRecordSeq" in value &&
+		typeof value.lastRecordSeq === "number" &&
+		Number.isSafeInteger(value.lastRecordSeq) &&
+		value.lastRecordSeq >= 0
 	);
 }
 
@@ -411,6 +593,7 @@ function isDurableRecord(value: unknown): value is DurableRecord {
 	switch (record.type) {
 		case "operation_started": {
 			if (typeof record.prompt !== "string") return false;
+			if (record.process !== undefined && !isDurableProcessIdentity(record.process)) return false;
 			if (record.prepared === undefined) return true;
 			if (!record.prepared || typeof record.prepared !== "object") return false;
 			const prepared = record.prepared as Record<string, unknown>;
@@ -493,6 +676,10 @@ function isDurableRecord(value: unknown): value is DurableRecord {
 			);
 		case "verification_recorded":
 			return isVerificationReceipt(record.receipt);
+		case "provider_payload_recorded":
+			return isProviderPayloadDiagnostic(record.diagnostic);
+		case "process_exit_recorded":
+			return isProcessExitDiagnostic(record.diagnostic);
 		case "operation_suspended":
 			return typeof record.error === "string";
 		case "resume_requested":
@@ -520,16 +707,24 @@ export class DurableOperationJournal {
 	readonly path: string;
 	readonly sessionId: string;
 	private readonly lease: { release(): void } | undefined;
+	private readonly blobStore: ContentAddressedStore;
+	private readonly processIdentity: DurableProcessIdentity;
 	private readonly operations = new Map<string, DurableOperationSnapshot>();
 	private readonly effects = new Map<string, Map<string, DurableEffectSnapshot>>();
+	private readonly records: DurableRecord[] = [];
 	private readonly resumeRequests = new Map<string, number>();
 	private readonly abortRequests = new Set<string>();
+	private readonly consumerOffsets = new Map<string, number>();
+	private sequence = 0;
+	private consumerOffsetsLoaded = false;
 	private loaded = false;
 	private closed = false;
 
 	constructor(path: string, sessionId: string, options?: { exclusive?: boolean; lease?: DurableOperationLease }) {
 		this.path = resolve(path);
 		this.sessionId = sessionId;
+		this.blobStore = new ContentAddressedStore(getDurableOperationArtifactPaths(this.path).blobsPath);
+		this.processIdentity = { pid: process.pid, instanceId: randomUUID(), startedAt: Date.now() };
 		if (options?.exclusive && options.lease) {
 			throw new Error("Provide either an exclusive durable lease or a transferred lease, not both.");
 		}
@@ -552,6 +747,17 @@ export class DurableOperationJournal {
 		if (!operation || operation.status === "suspended") {
 			return operation;
 		}
+		this.append({
+			type: "process_exit_recorded",
+			operationId: operation.id,
+			sessionId: this.sessionId,
+			diagnostic: {
+				kind: "unclean_exit",
+				previousProcess: operation.ownerProcess,
+				detectedBy: this.processIdentity,
+				lastRecordSeq: this.sequence,
+			},
+		});
 
 		for (const effect of operation.effects) {
 			if (effect.status === "dispatched") {
@@ -586,6 +792,7 @@ export class DurableOperationJournal {
 			operationId,
 			sessionId: this.sessionId,
 			prompt,
+			process: this.processIdentity,
 			prepared: prepared
 				? {
 						messages: cloneJson(prepared.messages) as unknown[],
@@ -796,6 +1003,71 @@ export class DurableOperationJournal {
 		});
 	}
 
+	recordProviderPayload(
+		operation: DurableOperationHandle,
+		input: { provider: string; model: string; api: string; payload: unknown },
+	): ProviderPayloadDiagnostic {
+		this.requireOpen(operation.id);
+		let serialized: string | undefined;
+		try {
+			serialized = JSON.stringify(input.payload);
+		} catch (error) {
+			throw new Error("Provider payload is not JSON serializable.", { cause: error });
+		}
+		if (serialized === undefined) throw new Error("Provider payload serialized to undefined.");
+		const bytes = Buffer.from(serialized);
+		const payload = this.blobStore.put(bytes);
+		this.ensureLoaded();
+		const previousRecord = this.records
+			.slice()
+			.reverse()
+			.find((record) => record.type === "provider_payload_recorded");
+		const previous = previousRecord?.type === "provider_payload_recorded" ? previousRecord.diagnostic : undefined;
+		let prefixBytes = 0;
+		let invalidationReason: ProviderPayloadInvalidationReason = "first_request";
+		if (previous) {
+			if (previous.provider !== input.provider) {
+				invalidationReason = "provider_changed";
+			} else if (previous.model !== input.model) {
+				invalidationReason = "model_changed";
+			} else if (previous.api !== input.api) {
+				invalidationReason = "api_changed";
+			} else {
+				const previousBytes = this.blobStore.get(previous.payload);
+				prefixBytes = commonPrefixBytes(previousBytes, bytes);
+				if (prefixBytes === previousBytes.length) {
+					invalidationReason = "none";
+				} else if (bytes.length < previousBytes.length) {
+					invalidationReason = "payload_shrank";
+				} else {
+					invalidationReason = "prefix_changed";
+				}
+			}
+		}
+		const storedDiagnostic: Omit<ProviderPayloadDiagnostic, "seq"> = {
+			provider: input.provider,
+			model: input.model,
+			api: input.api,
+			payload,
+			previousPayload: previous?.payload,
+			commonPrefixBytes: prefixBytes,
+			deltaBytes: bytes.length - prefixBytes,
+			stablePrefixRatio: bytes.length === 0 ? 1 : prefixBytes / bytes.length,
+			invalidationReason,
+		};
+		const record = this.append({
+			type: "provider_payload_recorded",
+			operationId: operation.id,
+			sessionId: this.sessionId,
+			diagnostic: storedDiagnostic,
+		});
+		return { seq: record.seq, ...storedDiagnostic };
+	}
+
+	readProviderPayload(ref: ContentAddressedBlobRef): unknown {
+		return JSON.parse(this.blobStore.get(ref).toString("utf8")) as unknown;
+	}
+
 	markEffectReconciled(operationId: string, key: string): void {
 		const operation = this.requireOpen(operationId);
 		const effect = operation.effects.find((candidate) => candidate.key === key);
@@ -850,6 +1122,59 @@ export class DurableOperationJournal {
 		return this.reduce().map((operation) => cloneSnapshot(operation));
 	}
 
+	getLog(options: { afterSeq?: number; limit?: number } = {}): DurableJournalRecord[] {
+		this.ensureLoaded();
+		if (options.afterSeq !== undefined && (!Number.isSafeInteger(options.afterSeq) || options.afterSeq < 0)) {
+			throw new Error("Durable journal cursor must be a non-negative safe integer.");
+		}
+		if (options.limit !== undefined && (!Number.isSafeInteger(options.limit) || options.limit <= 0)) {
+			throw new Error("Durable journal limit must be a positive safe integer.");
+		}
+		const items: DurableJournalRecord[] = [];
+		for (const record of this.records) {
+			if (options.afterSeq !== undefined && record.seq <= options.afterSeq) continue;
+			const { schema: _schema, seq, at, operationId, sessionId, type, ...data } = record;
+			items.push({ seq, at, operationId, sessionId, type, data: cloneJson(data) });
+			if (items.length === options.limit) break;
+		}
+		return items;
+	}
+
+	getConsumerOffset(consumerId: string): number {
+		this.validateConsumerId(consumerId);
+		this.loadConsumerOffsets();
+		return this.consumerOffsets.get(consumerId) ?? 0;
+	}
+
+	advanceConsumerOffset(consumerId: string, expectedOffset: number, nextOffset: number): void {
+		this.validateConsumerId(consumerId);
+		this.ensureLoaded();
+		this.loadConsumerOffsets();
+		for (const [name, value] of [
+			["expected", expectedOffset],
+			["next", nextOffset],
+		] as const) {
+			if (!Number.isSafeInteger(value) || value < 0) {
+				throw new Error(`Durable consumer ${name} offset must be a non-negative safe integer.`);
+			}
+		}
+		const current = this.consumerOffsets.get(consumerId) ?? 0;
+		if (current !== expectedOffset) {
+			throw new Error(`Durable consumer ${consumerId} offset changed from ${expectedOffset} to ${current}.`);
+		}
+		if (nextOffset < current || nextOffset > this.sequence) {
+			throw new Error(`Durable consumer ${consumerId} cannot advance to sequence ${nextOffset}.`);
+		}
+		this.consumerOffsets.set(consumerId, nextOffset);
+		try {
+			this.persistConsumerOffsets();
+		} catch (error) {
+			if (current === 0) this.consumerOffsets.delete(consumerId);
+			else this.consumerOffsets.set(consumerId, current);
+			throw error;
+		}
+	}
+
 	private resolveExistingEffect(
 		operation: DurableOperationHandle,
 		key: string,
@@ -894,14 +1219,69 @@ export class DurableOperationJournal {
 		return operation;
 	}
 
-	private append(record: NewDurableRecord): void {
+	private validateConsumerId(consumerId: string): void {
+		if (!/^[A-Za-z0-9._:-]{1,128}$/.test(consumerId)) {
+			throw new Error("Durable consumer id must use 1-128 letters, numbers, dots, underscores, colons, or hyphens.");
+		}
+	}
+
+	private loadConsumerOffsets(): void {
+		if (this.consumerOffsetsLoaded) return;
+		this.ensureLoaded();
+		const path = getDurableOperationArtifactPaths(this.path).consumersPath;
+		if (existsSync(path)) {
+			let value: unknown;
+			try {
+				value = JSON.parse(readFileSync(path, "utf8")) as unknown;
+			} catch (error) {
+				throw new Error(`Corrupt durable consumer offsets: ${path}`, { cause: error });
+			}
+			if (!isConsumerOffsetFile(value) || value.sessionId !== this.sessionId) {
+				throw new Error(`Corrupt durable consumer offsets: ${path}`);
+			}
+			for (const [consumerId, offset] of Object.entries(value.offsets)) {
+				this.validateConsumerId(consumerId);
+				if (offset > this.sequence) {
+					throw new Error(`Durable consumer ${consumerId} points past journal sequence ${this.sequence}.`);
+				}
+				this.consumerOffsets.set(consumerId, offset);
+			}
+		}
+		this.consumerOffsetsLoaded = true;
+	}
+
+	private persistConsumerOffsets(): void {
+		if (this.closed) throw new Error("Durable operation journal is closed.");
+		const path = getDurableOperationArtifactPaths(this.path).consumersPath;
+		mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+		const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+		const file: DurableConsumerOffsetFile = {
+			schema: 1,
+			sessionId: this.sessionId,
+			offsets: Object.fromEntries([...this.consumerOffsets].sort(([left], [right]) => left.localeCompare(right))),
+		};
+		try {
+			writeFileSync(temporaryPath, `${JSON.stringify(file)}\n`, { flag: "wx", mode: 0o600 });
+			renameSync(temporaryPath, path);
+			try {
+				chmodSync(path, 0o600);
+			} catch {
+				// Some filesystems do not expose POSIX mode bits.
+			}
+		} finally {
+			if (existsSync(temporaryPath)) unlinkSync(temporaryPath);
+		}
+	}
+
+	private append(record: NewDurableRecord): DurableRecord {
 		if (this.closed) {
 			throw new Error("Durable operation journal is closed.");
 		}
 		this.ensureLoaded();
 		const dir = dirname(this.path);
 		mkdirSync(dir, { recursive: true, mode: 0o700 });
-		const persisted = { ...record, schema: 1, at: Date.now() } as DurableRecord;
+		const nextSequence = this.sequence + 1;
+		const persisted = { ...record, schema: 1, seq: nextSequence, at: Date.now() } as DurableRecord;
 		this.validateRecordTransition(persisted);
 		const line = `${JSON.stringify(persisted)}\n`;
 		appendFileSync(this.path, line, { encoding: "utf8", mode: 0o600 });
@@ -910,7 +1290,10 @@ export class DurableOperationJournal {
 		} catch {
 			// Some filesystems do not expose POSIX mode bits.
 		}
+		this.sequence = nextSequence;
 		this.applyValidatedRecord(persisted);
+		this.records.push(persisted);
+		return persisted;
 	}
 
 	private readRecords(): DurableRecord[] {
@@ -939,12 +1322,19 @@ export class DurableOperationJournal {
 			if (!isDurableRecord(value)) {
 				throw new Error(`Corrupt durable operation journal at line ${index + 1}: invalid durable operation record`);
 			}
-			if (value.sessionId !== this.sessionId) {
+			const expectedSequence = records.length + 1;
+			if (value.seq !== undefined && value.seq !== expectedSequence) {
 				throw new Error(
-					`Corrupt durable operation journal at line ${index + 1}: durable operation session mismatch: ${value.sessionId}`,
+					`Corrupt durable operation journal at line ${index + 1}: expected sequence ${expectedSequence}, received ${value.seq}`,
 				);
 			}
-			records.push(value);
+			const record = value.seq === undefined ? ({ ...value, seq: expectedSequence } as DurableRecord) : value;
+			if (record.sessionId !== this.sessionId) {
+				throw new Error(
+					`Corrupt durable operation journal at line ${index + 1}: durable operation session mismatch: ${record.sessionId}`,
+				);
+			}
+			records.push(record);
 		}
 		if (text.length > 0 && !text.endsWith("\n")) {
 			appendFileSync(this.path, "\n", { encoding: "utf8", mode: 0o600 });
@@ -965,6 +1355,8 @@ export class DurableOperationJournal {
 		for (const record of this.readRecords()) {
 			this.validateRecordTransition(record);
 			this.applyValidatedRecord(record);
+			this.records.push(record);
+			this.sequence = record.seq;
 		}
 		this.loaded = true;
 	}
@@ -1135,6 +1527,60 @@ export class DurableOperationJournal {
 			}
 			return;
 		}
+		if (record.type === "provider_payload_recorded") {
+			if (operation.status !== "running") {
+				throw new Error(
+					`Cannot record a provider payload while operation ${record.operationId} is ${operation.status}`,
+				);
+			}
+			const previousRecord = this.records
+				.slice()
+				.reverse()
+				.find((candidate) => candidate.type === "provider_payload_recorded");
+			const previous = previousRecord?.type === "provider_payload_recorded" ? previousRecord.diagnostic : undefined;
+			const diagnostic = record.diagnostic;
+			const requiredLaneReason: ProviderPayloadInvalidationReason = !previous
+				? "first_request"
+				: previous.provider !== diagnostic.provider
+					? "provider_changed"
+					: previous.model !== diagnostic.model
+						? "model_changed"
+						: previous.api !== diagnostic.api
+							? "api_changed"
+							: diagnostic.invalidationReason;
+			if (
+				diagnostic.commonPrefixBytes > diagnostic.payload.bytes ||
+				diagnostic.deltaBytes !== diagnostic.payload.bytes - diagnostic.commonPrefixBytes ||
+				diagnostic.invalidationReason !== requiredLaneReason ||
+				(previous
+					? diagnostic.previousPayload?.digest !== previous.payload.digest ||
+						diagnostic.commonPrefixBytes > previous.payload.bytes ||
+						diagnostic.invalidationReason === "first_request"
+					: diagnostic.previousPayload !== undefined ||
+						diagnostic.commonPrefixBytes !== 0 ||
+						diagnostic.invalidationReason !== "first_request")
+			) {
+				throw new Error(`Invalid provider payload diagnostic at sequence ${record.seq}`);
+			}
+			return;
+		}
+		if (record.type === "process_exit_recorded") {
+			const previousProcess = operation.ownerProcess;
+			const recordedPrevious = record.diagnostic.previousProcess;
+			if (
+				(operation.status !== "accepted" && operation.status !== "running") ||
+				operation.processExits.length > 0 ||
+				record.diagnostic.lastRecordSeq !== record.seq - 1 ||
+				(previousProcess
+					? recordedPrevious?.pid !== previousProcess.pid ||
+						recordedPrevious.instanceId !== previousProcess.instanceId ||
+						recordedPrevious.startedAt !== previousProcess.startedAt
+					: recordedPrevious !== undefined)
+			) {
+				throw new Error(`Invalid process exit diagnostic at sequence ${record.seq}`);
+			}
+			return;
+		}
 		if (record.type === "operation_suspended") {
 			const legacyInterruptedResume =
 				operation.status === "suspended" && this.resumeRequests.has(record.operationId);
@@ -1191,6 +1637,9 @@ export class DurableOperationJournal {
 				checkpointCount: 0,
 				effects: [],
 				verificationReceipts: [],
+				providerPayloads: [],
+				processExits: [],
+				ownerProcess: record.process ? { ...record.process } : undefined,
 				prepared: record.prepared
 					? {
 							messages: cloneJson(record.prepared.messages) as unknown[],
@@ -1279,6 +1728,24 @@ export class DurableOperationJournal {
 			effect.reconciled = true;
 		} else if (record.type === "verification_recorded") {
 			operation.verificationReceipts.push(cloneJson(record.receipt) as VerificationReceipt);
+		} else if (record.type === "provider_payload_recorded") {
+			operation.providerPayloads.push({ seq: record.seq, ...record.diagnostic });
+			operation.checkpointCount += 1;
+			operation.lastCheckpoint = {
+				kind: "provider_request",
+				data: {
+					provider: record.diagnostic.provider,
+					model: record.diagnostic.model,
+					api: record.diagnostic.api,
+					payload: record.diagnostic.payload,
+					commonPrefixBytes: record.diagnostic.commonPrefixBytes,
+					stablePrefixRatio: record.diagnostic.stablePrefixRatio,
+					invalidationReason: record.diagnostic.invalidationReason,
+				},
+				at: record.at,
+			};
+		} else if (record.type === "process_exit_recorded") {
+			operation.processExits.push({ seq: record.seq, ...record.diagnostic });
 		} else if (record.type === "operation_suspended") {
 			operation.status = "suspended";
 			operation.error = record.error;

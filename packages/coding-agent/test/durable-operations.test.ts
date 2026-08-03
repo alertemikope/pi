@@ -138,6 +138,121 @@ describe("DurableOperationJournal", () => {
 		expect(restarted.get(operation.id)?.verificationReceipts).toEqual([receipt]);
 	});
 
+	it("stores final provider payloads in CAS and records prefix invalidation evidence", () => {
+		const journal = createJournal();
+		const firstOperation = journal.begin("First request");
+		const first = journal.recordProviderPayload(firstOperation, {
+			provider: "provider-a",
+			model: "model-a",
+			api: "openai-responses",
+			payload: { instructions: "stable", input: ["one"] },
+		});
+		journal.finish(firstOperation, "completed");
+
+		const secondOperation = journal.begin("Second request");
+		const second = journal.recordProviderPayload(secondOperation, {
+			provider: "provider-a",
+			model: "model-a",
+			api: "openai-responses",
+			payload: { instructions: "stable", input: ["one"] },
+		});
+		journal.finish(secondOperation, "completed");
+
+		const thirdOperation = journal.begin("Third request");
+		const third = journal.recordProviderPayload(thirdOperation, {
+			provider: "provider-a",
+			model: "model-a",
+			api: "openai-responses",
+			payload: { instructions: "stable", input: ["one", "two"] },
+		});
+		journal.finish(thirdOperation, "completed");
+
+		const fourthOperation = journal.begin("Fourth request");
+		const fourth = journal.recordProviderPayload(fourthOperation, {
+			provider: "provider-b",
+			model: "model-a",
+			api: "openai-responses",
+			payload: { instructions: "stable", input: ["one", "two"] },
+		});
+		journal.finish(fourthOperation, "completed");
+
+		expect(first).toMatchObject({
+			invalidationReason: "first_request",
+			commonPrefixBytes: 0,
+			previousPayload: undefined,
+		});
+		expect(second).toMatchObject({
+			invalidationReason: "none",
+			commonPrefixBytes: first.payload.bytes,
+			deltaBytes: 0,
+			previousPayload: first.payload,
+		});
+		expect(second.payload).toEqual(first.payload);
+		expect(third.invalidationReason).toBe("prefix_changed");
+		expect(third.commonPrefixBytes).toBeGreaterThan(0);
+		expect(third.commonPrefixBytes).toBeLessThan(third.payload.bytes);
+		expect(fourth).toMatchObject({
+			invalidationReason: "provider_changed",
+			commonPrefixBytes: 0,
+			previousPayload: third.payload,
+		});
+		expect(journal.readProviderPayload(first.payload)).toEqual({ instructions: "stable", input: ["one"] });
+		expect(journal.get(secondOperation.id)?.providerPayloads).toEqual([second]);
+	});
+
+	it("provides a sequenced production log with compare-and-set consumer offsets", () => {
+		const journal = createJournal();
+		const operation = journal.begin("Consume records");
+		journal.checkpoint(operation, "prepared");
+		journal.finish(operation, "completed");
+		const log = journal.getLog();
+
+		expect(log.map((record) => record.seq)).toEqual([1, 2, 3, 4]);
+		expect(journal.getLog({ afterSeq: 2 }).map((record) => record.seq)).toEqual([3, 4]);
+		journal.advanceConsumerOffset("indexer:main", 0, 4);
+		expect(journal.getConsumerOffset("indexer:main")).toBe(4);
+		expect(() => journal.advanceConsumerOffset("indexer:main", 0, 4)).toThrow(/changed from 0 to 4/);
+
+		const reopened = new DurableOperationJournal(journal.path, journal.sessionId);
+		expect(reopened.getConsumerOffset("indexer:main")).toBe(4);
+		expect(reopened.getLog({ afterSeq: reopened.getConsumerOffset("indexer:main") })).toEqual([]);
+	});
+
+	it("provisions sequences for legacy records before appending new sequenced records", () => {
+		tempDir = mkdtempSync(join(tmpdir(), "pi-durable-legacy-sequence-"));
+		const path = join(tempDir, "operations.jsonl");
+		const sessionId = "legacy-session";
+		const operationId = "legacy-operation";
+		writeFileSync(
+			path,
+			`${JSON.stringify({
+				schema: 1,
+				type: "operation_started",
+				at: 1,
+				operationId,
+				sessionId,
+				prompt: "legacy",
+			})}\n${JSON.stringify({
+				schema: 1,
+				type: "task_attempt",
+				at: 2,
+				operationId,
+				sessionId,
+				attempt: 1,
+				recovered: false,
+			})}\n`,
+		);
+		const journal = new DurableOperationJournal(path, sessionId);
+		journal.checkpoint({ id: operationId, attempt: 1, recovered: false }, "continued");
+
+		expect(journal.getLog().map((record) => record.seq)).toEqual([1, 2, 3]);
+		const rawRecords = readFileSync(path, "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as { seq?: number });
+		expect(rawRecords.map((record) => record.seq)).toEqual([undefined, undefined, 3]);
+	});
+
 	it("recovers a crash between operation acceptance and the first task attempt", () => {
 		const journal = createJournal();
 		const operationId = "accepted-only";
@@ -437,6 +552,26 @@ describe("DurableOperationJournal", () => {
 
 		const restarted = new DurableOperationJournal(journal.path, journal.sessionId);
 		expect(() => restarted.list()).toThrow(/invalid durable operation record/);
+	});
+
+	it("rejects gaps and rewinds in explicit journal sequences", () => {
+		const journal = createJournal();
+		const operation = journal.begin("Keep total ordering");
+		appendFileSync(
+			journal.path,
+			`${JSON.stringify({
+				schema: 1,
+				seq: 99,
+				type: "checkpoint",
+				at: Date.now(),
+				operationId: operation.id,
+				sessionId: journal.sessionId,
+				kind: "out-of-order",
+			})}\n`,
+		);
+
+		const restarted = new DurableOperationJournal(journal.path, journal.sessionId);
+		expect(() => restarted.list()).toThrow(/expected sequence 3, received 99/);
 	});
 
 	it("rejects structurally valid records after a terminal operation", () => {

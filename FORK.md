@@ -51,6 +51,16 @@ Le fork ajoute dès maintenant les propriétés suivantes au coding agent :
   `/recover abort`.
 - des receipts de vérification exécutés par le host, avec commande, cwd,
   terminaison typée, hashes complets et extraits bornés de stdout/stderr ;
+- une tentative corrective automatique, cachée et strictement bornée, suivie
+  d'une nouvelle exécution des checks host ;
+- une identité d'opération stable exposée aux extensions sur `agent_start` et
+  `agent_settled` ;
+- des diagnostics d'arrêt non propre avec identité de processus, vérifiés par
+  une matrice de vrais crashs `SIGKILL` ;
+- un journal explicitement séquencé, des offsets consommateurs persistants en
+  compare-and-set et un CAS SHA-256 privé pour les payloads volumineux ;
+- la comparaison du payload provider final, après les transformations des
+  extensions, avec taille du préfixe commun et raison d'invalidation ;
 - une classification structurée des erreurs assistant avec type, caractère
   rejouable et action de récupération (`wait`, `compact`, `reauthenticate`,
   `change_model`, etc.).
@@ -70,10 +80,14 @@ Implémenté :
 - `StepAttemptRecord.resultEntryId` et ledger `UsageRecord` alignés sur le
   design final ;
 - séparation durable réservation/dispatch/settlement des outils ;
-- refus d'abandonner un effet externe non réconcilié.
+- refus d'abandonner un effet externe non réconcilié ;
+- diagnostic durable du processus interrompu et tests `SIGKILL` réels pour les
+  états sans effet, réservé et dispatché.
 
-Restant : diagnostics de sortie processus, reaper fail-closed, contrats de
-capacités persistés pour les subagents et vrais tests de crash par processus.
+Restant : le reaper et les contrats de capacités subagent/lane seront ajoutés
+avec le scheduler natif correspondant. Le runtime actuel ne possède pas encore
+de processus subagent ou de lane d'exécution auquel raccorder ce contrat ; une
+abstraction vide a volontairement été évitée.
 
 ### Phase 2 — fiabilité coding
 
@@ -81,20 +95,27 @@ Implémenté : résultat processus discriminé, receipts de vérification
 host-attested persistés dans l'opération active et API
 `registerVerificationCheck()` permettant aux extensions de déclarer une
 politique sans pouvoir fabriquer elles-mêmes la preuve. Un check en échec fait
-échouer l'opération avant son settlement.
+déclencher au maximum une continuation corrective cachée, puis échouer
+l'opération si la seconde preuve reste négative. Le core expose aussi une
+identité d'opération stable aux extensions.
 
-Restant : correction automatique bornée après un check en échec, snapshots Git
-par opération, transactions de workspace et isolation worktree des lanes. Ces
-politiques resteront des extensions construites sur les primitives core.
+L'extension `git-operation-snapshots` crée un snapshot tracked-only avec
+`git stash create`, l'ancre sous `refs/pi/operation-snapshots/...`, persiste ses
+métadonnées et ne restaure jamais automatiquement. Elle bloque les mutations si
+la preuve de snapshot échoue.
+
+Restant : transaction de workspace complète et isolation worktree des lanes.
+Ces politiques resteront des extensions construites sur le futur scheduler de
+lanes ; un snapshot Git n'est pas présenté comme un rollback atomique.
 
 ### Phase 3 — performance et observabilité
 
-Implémenté : ledger de coût Harness v2 et taxonomie structurée des échecs avec
-actions de récupération.
-
-Restant : comparaison du payload provider pour mesurer la stabilité du
-préfixe, journal de production séquencé, offsets durables des consommateurs et
-stockage CAS des payloads volumineux.
+Implémenté : ledger de coût Harness v2, taxonomie structurée des échecs avec
+actions de récupération, payload provider final stocké en CAS SHA-256,
+comparaison byte-à-byte du préfixe commun, raisons d'invalidation explicites,
+journal de production séquencé et offsets consommateurs durables en
+compare-and-set. Ces métriques décrivent la forme de requête côté client ; elles
+ne prétendent pas prouver un cache hit provider.
 
 ## Journal
 
@@ -111,12 +132,24 @@ Pi crée un journal séparé :
 ```
 
 Le transcript v3 upstream n'est donc pas modifié et reste lisible par Pi
-upstream. Le journal JSONL est append-only, utilise le schéma `1`, et
-reconstruit l'état des opérations au chargement. Une dernière ligne JSON
+upstream. Le journal JSONL est append-only, utilise le schéma `1`, porte une
+séquence strictement contiguë sur les nouveaux records et reconstruit l'état
+des opérations au chargement. Une dernière ligne JSON
 partiellement écrite est supprimée ; un record complet invalide ou une
 corruption ailleurs arrête le chargement au lieu de masquer la perte de
 données. L'état réduit est ensuite conservé en mémoire : Pi ne reparcourt pas
 le journal complet à chaque appel d'outil.
+
+Les anciens records sans `seq` reçoivent leur position de ligne lors de la
+lecture ; toute séquence explicite manquante, dupliquée ou réordonnée est une
+corruption. Les consommateurs peuvent conserver un offset compare-and-set dans
+`<session-file>.operations.jsonl.consumers.json`.
+
+Les payloads provider complets ne sont pas dupliqués dans le JSONL. Ils sont
+stockés par hash sous `<session-file>.operations.jsonl.blobs/`; le record garde
+le digest, la taille, le préfixe commun et la raison d'invalidation. Une lecture
+revérifie taille et SHA-256. Ces payloads contiennent potentiellement prompts,
+outils et historique privé et doivent être protégés comme la session.
 
 Lorsqu'une session est ouverte par le runtime, Pi crée également :
 
@@ -139,10 +172,12 @@ lorsque le système de fichiers prend en charge les permissions POSIX.
 
 Le journal contient notamment le prompt, les messages préparés, le system
 prompt, les réservations et dispatchs d'outils, leurs résultats finaux après
-hooks, les erreurs et les receipts de vérification. Il doit être protégé comme
+hooks, les erreurs, les diagnostics d'arrêt, les références CAS et les receipts
+de vérification. Il doit être protégé comme
 le fichier de session lui-même et ne doit pas être publié sans vérification.
 Supprimer une session depuis le sélecteur Pi supprime ou met à la corbeille son
-sidecar exact ; les sidecars sont exclus de la liste des sessions.
+sidecar, ses offsets et ses blobs exacts ; ces artefacts sont exclus de la liste
+des sessions.
 
 Les sessions en mémoire ne créent pas de journal et ne proposent pas la
 reprise durable.

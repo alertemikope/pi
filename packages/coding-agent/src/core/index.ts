@@ -28,10 +28,16 @@ export {
 export { type BashExecutorOptions, type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 export type { CompactionResult } from "./compaction/index.ts";
 export {
+	type ContentAddressedBlobRef,
+	ContentAddressedStore,
+	isContentAddressedBlobRef,
+} from "./content-addressed-store.ts";
+export {
 	acquireDurableOperationLease,
 	type DurableEffectClaim,
 	type DurableEffectSnapshot,
 	type DurableEffectStatus,
+	type DurableJournalRecord,
 	type DurableOperationHandle,
 	DurableOperationJournal,
 	type DurableOperationLease,
@@ -39,7 +45,12 @@ export {
 	type DurableOperationSnapshot,
 	type DurableOperationStatus,
 	type DurablePreparedInput,
+	type DurableProcessExitDiagnostic,
+	type DurableProcessIdentity,
 	type DurableReplayPolicy,
+	getDurableOperationArtifactPaths,
+	type ProviderPayloadDiagnostic,
+	type ProviderPayloadInvalidationReason,
 } from "./durable-operations.ts";
 export { createEventBus, type EventBus, type EventBusController } from "./event-bus.ts";
 export { areExperimentalFeaturesEnabled } from "./experimental.ts";

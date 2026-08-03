@@ -707,13 +707,16 @@ export class AgentSession {
 	private _installDurableProviderHook(): void {
 		const previousOnPayload = this.agent.onPayload;
 		this.agent.onPayload = async (payload, model) => {
+			const finalPayload = previousOnPayload ? await previousOnPayload(payload, model) : payload;
 			if (this._durableOperations && this._activeDurableOperation) {
-				this._durableOperations.checkpoint(this._activeDurableOperation, "provider_request", {
+				this._durableOperations.recordProviderPayload(this._activeDurableOperation, {
 					provider: model.provider,
 					model: model.id,
+					api: model.api,
+					payload: finalPayload,
 				});
 			}
-			return previousOnPayload ? await previousOnPayload(payload, model) : payload;
+			return finalPayload;
 		};
 	}
 
