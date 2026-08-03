@@ -1,4 +1,6 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
@@ -213,7 +215,58 @@ describe("durable AgentSession integration", () => {
 		}
 	});
 
-	it("fails the durable operation when an extension-declared verification fails", async () => {
+	it("runs one hidden corrective turn and completes after verification passes", async () => {
+		const verificationState = join(tmpdir(), `pi-verification-${Date.now()}-${Math.random()}`);
+		let correctiveContext = "";
+		const harness = await createHarness({
+			persistentSession: true,
+			extensionFactories: [
+				(pi) => {
+					pi.registerVerificationCheck({
+						id: "correctable-check",
+						command: process.execPath,
+						args: [
+							"-e",
+							"const fs=require('node:fs'); const p=process.argv[1]; if(!fs.existsSync(p)){fs.writeFileSync(p,'failed-once'); process.stderr.write('needs correction'); process.exit(2)}",
+							verificationState,
+						],
+					});
+				},
+			],
+		});
+
+		try {
+			harness.setResponses([
+				() => fauxAssistantMessage("claimed done"),
+				(context) => {
+					correctiveContext = context.messages
+						.filter((message) => message.role === "user")
+						.map((message) => getMessageText(message))
+						.join("\n");
+					return fauxAssistantMessage("corrected");
+				},
+			]);
+			await harness.session.prompt("verify and repair");
+
+			const operation = durableJournal(harness.session).list().at(-1);
+			const correctionEntries = harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom_message" && entry.customType === "pi.verification-correction");
+			expect(operation?.status).toBe("completed");
+			expect(operation?.verificationReceipts.map((receipt) => receipt.verdict)).toEqual(["failed", "passed"]);
+			expect(correctionEntries).toHaveLength(1);
+			expect(correctionEntries[0]).toMatchObject({ display: false });
+			expect(correctiveContext).toContain("HOST VERIFICATION FAILED");
+			expect(correctiveContext).toContain("needs correction");
+			expect(harness.session.getUserMessagesForForking()).toHaveLength(1);
+			expect(harness.session.getSessionStats().userMessages).toBe(1);
+		} finally {
+			harness.cleanup();
+			rmSync(verificationState, { force: true });
+		}
+	});
+
+	it("fails after exactly one corrective turn when verification still fails", async () => {
 		const harness = await createHarness({
 			persistentSession: true,
 			extensionFactories: [
@@ -228,14 +281,21 @@ describe("durable AgentSession integration", () => {
 		});
 
 		try {
-			harness.setResponses([() => fauxAssistantMessage("done")]);
+			harness.setResponses([() => fauxAssistantMessage("done"), () => fauxAssistantMessage("still done")]);
 			await expect(harness.session.prompt("do not claim success")).rejects.toThrow(/failing-check.*broken/s);
 
 			const operation = durableJournal(harness.session).list().at(-1);
 			expect(operation?.status).toBe("failed");
 			expect(operation?.verificationReceipts).toEqual([
 				expect.objectContaining({ criterionId: "failing-check", verdict: "failed" }),
+				expect.objectContaining({ criterionId: "failing-check", verdict: "failed" }),
 			]);
+			expect(
+				harness.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "custom_message" && entry.customType === "pi.verification-correction"),
+			).toHaveLength(1);
+			expect(harness.getPendingResponseCount()).toBe(0);
 		} finally {
 			harness.cleanup();
 		}

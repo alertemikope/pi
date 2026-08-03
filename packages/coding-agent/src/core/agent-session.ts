@@ -371,6 +371,13 @@ interface ToolDefinitionEntry {
 	sourceInfo: SourceInfo;
 }
 
+interface RegisteredVerificationFailure {
+	criterionId: string;
+	sourcePath: string;
+	receipt?: VerificationReceipt;
+	error?: string;
+}
+
 function estimateMessagesTokens(messages: AgentMessage[]): number {
 	let tokens = 0;
 	for (const message of messages) {
@@ -385,6 +392,8 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
+const VERIFICATION_CORRECTION_MESSAGE_TYPE = "pi.verification-correction";
+const VERIFICATION_CORRECTION_TEXT_LIMIT = 16 * 1024;
 
 // ============================================================================
 // AgentSession Class
@@ -474,6 +483,8 @@ export class AgentSession {
 		| { messages: AgentMessage[]; nextIndex: number; systemPrompt?: string }
 		| undefined;
 	private _verificationFailure: Error | undefined;
+	private _verificationAbortController: AbortController | undefined;
+	private _verificationAborted = false;
 	private _disposeStarted = false;
 	private _disposeFinalized = false;
 
@@ -1114,6 +1125,7 @@ export class AgentSession {
 			this.abortCompaction();
 			this.abortBranchSummary();
 			this.abortBash();
+			this._verificationAbortController?.abort();
 			this.agent.abort();
 		} catch {
 			// Dispose must succeed even if an abort hook throws.
@@ -1393,6 +1405,7 @@ export class AgentSession {
 					}
 				: undefined;
 		this._verificationFailure = undefined;
+		this._verificationAborted = false;
 		this._isAgentRunActive = true;
 		let outcome: "completed" | "failed" | "aborted" = "completed";
 		let operationError: string | undefined;
@@ -1404,7 +1417,10 @@ export class AgentSession {
 				await this.agent.continue();
 			}
 			const verificationFailure = this._takeVerificationFailure();
-			if (verificationFailure) {
+			if (this._verificationAborted) {
+				outcome = "aborted";
+				operationError = "Host verification was aborted";
+			} else if (verificationFailure) {
 				outcome = "failed";
 				operationError = verificationFailure.message;
 				deferredError = verificationFailure;
@@ -1690,31 +1706,119 @@ export class AgentSession {
 		if (this.agent.hasQueuedMessages()) return true;
 
 		if (msg.stopReason === "stop") {
-			await this._runRegisteredVerifications();
+			return await this._runRegisteredVerifications();
 		}
 		return false;
 	}
 
-	private async _runRegisteredVerifications(): Promise<void> {
+	private async _runRegisteredVerifications(): Promise<boolean> {
 		const checks = this._extensionRunner.getAllVerificationChecks();
-		if (checks.length === 0) return;
-		const failures: string[] = [];
-		for (const { definition, sourceInfo } of checks) {
-			try {
-				const receipt = await this.runVerification(definition);
-				if (receipt.verdict === "failed") {
-					const output = receipt.stderr.excerpt.trim() || receipt.stdout.excerpt.trim();
-					failures.push(`${definition.id} (${sourceInfo.path}): ${output || JSON.stringify(receipt.termination)}`);
+		if (checks.length === 0) return false;
+		const failures: RegisteredVerificationFailure[] = [];
+		const controller = new AbortController();
+		this._verificationAbortController = controller;
+		try {
+			for (const { definition, sourceInfo } of checks) {
+				try {
+					const receipt = await this.runVerification(definition, controller.signal);
+					if (receipt.verdict === "failed") {
+						failures.push({ criterionId: definition.id, sourcePath: sourceInfo.path, receipt });
+					}
+				} catch (error) {
+					failures.push({
+						criterionId: definition.id,
+						sourcePath: sourceInfo.path,
+						error: error instanceof Error ? error.message : String(error),
+					});
 				}
-			} catch (error) {
-				failures.push(
-					`${definition.id} (${sourceInfo.path}): ${error instanceof Error ? error.message : String(error)}`,
-				);
+				if (controller.signal.aborted) break;
+			}
+		} finally {
+			if (this._verificationAbortController === controller) {
+				this._verificationAbortController = undefined;
 			}
 		}
-		if (failures.length > 0) {
-			this._verificationFailure = new Error(`Host verification failed:\n${failures.join("\n")}`);
+
+		if (controller.signal.aborted) {
+			this._verificationAborted = true;
+			return false;
 		}
+		if (failures.length === 0) return false;
+
+		const operation = this._activeDurableOperation;
+		const hasUnattestedFailure = failures.some((failure) => failure.receipt === undefined);
+		const correctionAlreadyAttempted =
+			operation !== undefined &&
+			this.sessionManager
+				.getBranch()
+				.some(
+					(entry) =>
+						entry.type === "custom_message" &&
+						entry.customType === VERIFICATION_CORRECTION_MESSAGE_TYPE &&
+						!!entry.details &&
+						typeof entry.details === "object" &&
+						"operationId" in entry.details &&
+						entry.details.operationId === operation.id,
+				);
+		if (operation && !hasUnattestedFailure && !correctionAlreadyAttempted) {
+			const failureText = this._formatVerificationFailures(failures, VERIFICATION_CORRECTION_TEXT_LIMIT);
+			const message: CustomMessage<{
+				operationId: string;
+				attempt: 1;
+				failedReceiptIds: string[];
+			}> = {
+				role: "custom",
+				customType: VERIFICATION_CORRECTION_MESSAGE_TYPE,
+				content: [
+					"[HOST VERIFICATION FAILED]",
+					"The host checks below failed after your previous response.",
+					"Inspect the evidence, correct the project, and finish the requested work.",
+					"Exactly one corrective attempt is available; the host will rerun every check automatically.",
+					"",
+					failureText,
+				].join("\n"),
+				display: false,
+				details: {
+					operationId: operation.id,
+					attempt: 1,
+					failedReceiptIds: failures.flatMap((failure) => (failure.receipt ? [failure.receipt.id] : [])),
+				},
+				timestamp: Date.now(),
+			};
+			this.sessionManager.appendCustomMessageEntry(
+				message.customType,
+				message.content,
+				message.display,
+				message.details,
+				message.timestamp,
+			);
+			this.agent.state.messages.push(message);
+			return true;
+		}
+
+		this._verificationFailure = new Error(
+			`Host verification failed:\n${this._formatVerificationFailures(failures, VERIFICATION_CORRECTION_TEXT_LIMIT)}`,
+		);
+		return false;
+	}
+
+	private _formatVerificationFailures(failures: RegisteredVerificationFailure[], limit: number): string {
+		let text = failures
+			.map((failure) => {
+				const output = failure.receipt
+					? failure.receipt.stderr.excerpt.trim() ||
+						failure.receipt.stdout.excerpt.trim() ||
+						JSON.stringify(failure.receipt.termination)
+					: failure.error;
+				return `${failure.criterionId} (${failure.sourcePath}): ${output || "verification failed"}`;
+			})
+			.join("\n");
+		if (Buffer.byteLength(text) <= limit) return text;
+		const suffix = "\n[verification failure text truncated]";
+		text = Buffer.from(text)
+			.subarray(0, Math.max(0, limit - Buffer.byteLength(suffix)))
+			.toString("utf8");
+		return `${text}${suffix}`;
 	}
 
 	private _takeVerificationFailure(): Error | undefined {
@@ -2189,6 +2293,7 @@ export class AgentSession {
 	 */
 	async abort(): Promise<void> {
 		this.abortRetry();
+		this._verificationAbortController?.abort();
 		this.agent.abort();
 		await this.waitForIdle();
 	}
