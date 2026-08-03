@@ -473,6 +473,7 @@ export class AgentSession {
 	private _pendingDurablePreparedInput:
 		| { messages: AgentMessage[]; nextIndex: number; systemPrompt?: string }
 		| undefined;
+	private _verificationFailure: Error | undefined;
 	private _disposeStarted = false;
 	private _disposeFinalized = false;
 
@@ -1391,6 +1392,7 @@ export class AgentSession {
 						systemPrompt: this.agent.state.systemPrompt,
 					}
 				: undefined;
+		this._verificationFailure = undefined;
 		this._isAgentRunActive = true;
 		let outcome: "completed" | "failed" | "aborted" = "completed";
 		let operationError: string | undefined;
@@ -1401,13 +1403,20 @@ export class AgentSession {
 			while (await this._handlePostAgentRun()) {
 				await this.agent.continue();
 			}
-			const lastAssistant = this._findLastAssistantMessage();
-			if (lastAssistant?.stopReason === "aborted") {
-				outcome = "aborted";
-				operationError = lastAssistant.errorMessage;
-			} else if (lastAssistant?.stopReason === "error") {
+			const verificationFailure = this._takeVerificationFailure();
+			if (verificationFailure) {
 				outcome = "failed";
-				operationError = lastAssistant.errorMessage;
+				operationError = verificationFailure.message;
+				deferredError = verificationFailure;
+			} else {
+				const lastAssistant = this._findLastAssistantMessage();
+				if (lastAssistant?.stopReason === "aborted") {
+					outcome = "aborted";
+					operationError = lastAssistant.errorMessage;
+				} else if (lastAssistant?.stopReason === "error") {
+					outcome = "failed";
+					operationError = lastAssistant.errorMessage;
+				}
 			}
 		} catch (error) {
 			deferredError = error instanceof Error ? error : new Error(String(error));
@@ -1678,7 +1687,40 @@ export class AgentSession {
 
 		// The agent loop drains both queues before emitting agent_end. Any messages
 		// here were queued by agent_end extension handlers and need a continuation.
-		return this.agent.hasQueuedMessages();
+		if (this.agent.hasQueuedMessages()) return true;
+
+		if (msg.stopReason === "stop") {
+			await this._runRegisteredVerifications();
+		}
+		return false;
+	}
+
+	private async _runRegisteredVerifications(): Promise<void> {
+		const checks = this._extensionRunner.getAllVerificationChecks();
+		if (checks.length === 0) return;
+		const failures: string[] = [];
+		for (const { definition, sourceInfo } of checks) {
+			try {
+				const receipt = await this.runVerification(definition);
+				if (receipt.verdict === "failed") {
+					const output = receipt.stderr.excerpt.trim() || receipt.stdout.excerpt.trim();
+					failures.push(`${definition.id} (${sourceInfo.path}): ${output || JSON.stringify(receipt.termination)}`);
+				}
+			} catch (error) {
+				failures.push(
+					`${definition.id} (${sourceInfo.path}): ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
+		if (failures.length > 0) {
+			this._verificationFailure = new Error(`Host verification failed:\n${failures.join("\n")}`);
+		}
+	}
+
+	private _takeVerificationFailure(): Error | undefined {
+		const failure = this._verificationFailure;
+		this._verificationFailure = undefined;
+		return failure;
 	}
 
 	private async _assertModelAndAuthReady(): Promise<void> {

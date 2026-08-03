@@ -82,9 +82,11 @@ import type {
 	ReadToolInput,
 	WriteToolInput,
 } from "../tools/index.ts";
+import type { VerificationCheck } from "../verification.ts";
 
 export type { ExecOptions, ExecResult, ProcessTermination } from "../exec.ts";
 export type { BuildSystemPromptOptions } from "../system-prompt.ts";
+export type { VerificationCheck } from "../verification.ts";
 export type { AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode };
 export type { AppKeybinding, KeybindingsManager } from "../keybindings.ts";
 
@@ -1247,6 +1249,9 @@ export interface ExtensionAPI {
 		tool: ToolDefinition<TParams, TDetails, TState>,
 	): void;
 
+	/** Declare a check that trusted core executes and attests before a durable run settles. */
+	registerVerificationCheck(check: VerificationCheck): void;
+
 	// =========================================================================
 	// Command, Shortcut, Flag Registration
 	// =========================================================================
@@ -1524,6 +1529,11 @@ export interface RegisteredTool {
 	sourceInfo: SourceInfo;
 }
 
+export interface RegisteredVerificationCheck {
+	definition: VerificationCheck;
+	sourceInfo: SourceInfo;
+}
+
 export interface ExtensionFlag {
 	name: string;
 	description?: string;
@@ -1685,6 +1695,7 @@ export interface Extension {
 	sourceInfo: SourceInfo;
 	handlers: Map<string, HandlerFn[]>;
 	tools: Map<string, RegisteredTool>;
+	verificationChecks: Map<string, RegisteredVerificationCheck>;
 	messageRenderers: Map<string, MessageRenderer>;
 	markdownTransformer?: MarkdownTransformer;
 	entryRenderers?: Map<string, EntryRenderer>;

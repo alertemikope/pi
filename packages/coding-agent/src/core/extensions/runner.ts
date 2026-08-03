@@ -49,6 +49,7 @@ import type {
 	ProviderConfig,
 	RegisteredCommand,
 	RegisteredTool,
+	RegisteredVerificationCheck,
 	ReplacedSessionContext,
 	ResolvedCommand,
 	ResourcesDiscoverEvent,
@@ -458,6 +459,17 @@ export class ExtensionRunner {
 			}
 		}
 		return Array.from(toolsByName.values());
+	}
+
+	/** Get declared verification checks from all extensions (first registration per id wins). */
+	getAllVerificationChecks(): RegisteredVerificationCheck[] {
+		const checksById = new Map<string, RegisteredVerificationCheck>();
+		for (const extension of this.extensions) {
+			for (const [id, check] of extension.verificationChecks) {
+				if (!checksById.has(id)) checksById.set(id, check);
+			}
+		}
+		return [...checksById.values()];
 	}
 
 	/** Get a tool definition by name. Returns undefined if not found. */

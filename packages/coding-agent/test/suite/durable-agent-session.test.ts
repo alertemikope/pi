@@ -185,6 +185,62 @@ describe("durable AgentSession integration", () => {
 		}
 	});
 
+	it("runs extension-declared verification before settling", async () => {
+		const harness = await createHarness({
+			persistentSession: true,
+			extensionFactories: [
+				(pi) => {
+					pi.registerVerificationCheck({
+						id: "extension-check",
+						command: process.execPath,
+						args: ["-e", "process.stdout.write('verified')"],
+					});
+				},
+			],
+		});
+
+		try {
+			harness.setResponses([() => fauxAssistantMessage("done")]);
+			await harness.session.prompt("verify automatically");
+
+			const operation = durableJournal(harness.session).list().at(-1);
+			expect(operation?.status).toBe("completed");
+			expect(operation?.verificationReceipts).toEqual([
+				expect.objectContaining({ criterionId: "extension-check", verdict: "passed" }),
+			]);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("fails the durable operation when an extension-declared verification fails", async () => {
+		const harness = await createHarness({
+			persistentSession: true,
+			extensionFactories: [
+				(pi) => {
+					pi.registerVerificationCheck({
+						id: "failing-check",
+						command: process.execPath,
+						args: ["-e", "process.stderr.write('broken'); process.exit(2)"],
+					});
+				},
+			],
+		});
+
+		try {
+			harness.setResponses([() => fauxAssistantMessage("done")]);
+			await expect(harness.session.prompt("do not claim success")).rejects.toThrow(/failing-check.*broken/s);
+
+			const operation = durableJournal(harness.session).list().at(-1);
+			expect(operation?.status).toBe("failed");
+			expect(operation?.verificationReceipts).toEqual([
+				expect.objectContaining({ criterionId: "failing-check", verdict: "failed" }),
+			]);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
 	it("rejects a suspended prompt before extension input hooks and reports failed preflight", async () => {
 		let inputEvents = 0;
 		const harness = await createHarness({

@@ -77,12 +77,15 @@ capacités persistés pour les subagents et vrais tests de crash par processus.
 
 ### Phase 2 — fiabilité coding
 
-Implémenté : résultat processus discriminé et receipts de vérification
-host-attested persistés dans l'opération active.
+Implémenté : résultat processus discriminé, receipts de vérification
+host-attested persistés dans l'opération active et API
+`registerVerificationCheck()` permettant aux extensions de déclarer une
+politique sans pouvoir fabriquer elles-mêmes la preuve. Un check en échec fait
+échouer l'opération avant son settlement.
 
-Restant : politique verify-on-stop, snapshots Git par opération, transactions
-de workspace et isolation worktree des lanes. Ces politiques resteront des
-extensions construites sur les primitives core.
+Restant : correction automatique bornée après un check en échec, snapshots Git
+par opération, transactions de workspace et isolation worktree des lanes. Ces
+politiques resteront des extensions construites sur les primitives core.
 
 ### Phase 3 — performance et observabilité
 
