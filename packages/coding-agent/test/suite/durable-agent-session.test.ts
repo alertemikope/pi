@@ -15,6 +15,37 @@ function durableJournal(session: object): DurableOperationJournal {
 }
 
 describe("durable AgentSession integration", () => {
+	it("exposes one stable operation identity across extension lifecycle events", async () => {
+		const starts: Array<{ id: string; attempt: number; recovered: boolean } | undefined> = [];
+		const settlements: Array<{ id?: string; outcome: string }> = [];
+		const harness = await createHarness({
+			persistentSession: true,
+			extensionFactories: [
+				(pi) => {
+					pi.on("agent_start", (event) => {
+						starts.push(event.operation);
+					});
+					pi.on("agent_settled", (event) => {
+						settlements.push({ id: event.operation?.id, outcome: event.outcome });
+					});
+				},
+			],
+		});
+
+		try {
+			harness.setResponses([() => fauxAssistantMessage("done")]);
+			await harness.session.prompt("identify this operation");
+
+			expect(starts).toEqual([expect.objectContaining({ attempt: 1, recovered: false })]);
+			expect(settlements).toEqual([{ id: starts[0]?.id, outcome: "completed" }]);
+			expect(harness.eventsOfType("agent_settled")).toEqual([
+				expect.objectContaining({ operation: starts[0], outcome: "completed" }),
+			]);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
 	it("journals a normal Pi run without replacing tools, prompt handling, or events", async () => {
 		let executions = 0;
 		const harness = await createHarness({

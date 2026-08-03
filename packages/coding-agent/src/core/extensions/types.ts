@@ -710,9 +710,19 @@ export interface BeforeAgentStartEvent {
 	systemPromptOptions: BuildSystemPromptOptions;
 }
 
+export interface AgentOperationInfo {
+	id: string;
+	attempt: number;
+	recovered: boolean;
+}
+
+export type AgentOperationOutcome = "completed" | "failed" | "aborted" | "suspended";
+
 /** Fired when an agent loop starts */
 export interface AgentStartEvent {
 	type: "agent_start";
+	/** Stable durable operation identity. Undefined for in-memory sessions. */
+	operation?: AgentOperationInfo;
 }
 
 /** Fired when an agent loop ends */
@@ -724,6 +734,10 @@ export interface AgentEndEvent {
 /** Fired after an agent run has fully settled and no automatic retry, compaction, or queued continuation will run. */
 export interface AgentSettledEvent {
 	type: "agent_settled";
+	/** Stable durable operation identity. Undefined for in-memory sessions. */
+	operation?: AgentOperationInfo;
+	outcome: AgentOperationOutcome;
+	error?: string;
 }
 
 /** Fired at the start of each turn */

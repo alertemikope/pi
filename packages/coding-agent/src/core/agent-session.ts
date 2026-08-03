@@ -79,6 +79,8 @@ import {
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
+	type AgentOperationInfo,
+	type AgentOperationOutcome,
 	type ContextUsage,
 	type ExtensionCommandContextActions,
 	type ExtensionErrorListener,
@@ -162,7 +164,12 @@ export type AgentSessionEvent =
 			messages: AgentMessage[];
 			willRetry: boolean;
 	  }
-	| { type: "agent_settled" }
+	| {
+			type: "agent_settled";
+			operation?: AgentOperationInfo;
+			outcome: AgentOperationOutcome;
+			error?: string;
+	  }
 	| {
 			type: "queue_update";
 			steering: readonly string[];
@@ -760,11 +767,15 @@ export class AgentSession {
 		resolve();
 	}
 
-	private async _emitAgentSettled(): Promise<void> {
+	private async _emitAgentSettled(event: {
+		operation?: AgentOperationInfo;
+		outcome: AgentOperationOutcome;
+		error?: string;
+	}): Promise<void> {
 		this._isAgentRunActive = false;
 		try {
-			await this._extensionRunner.emit({ type: "agent_settled" });
-			this._emit({ type: "agent_settled" });
+			await this._extensionRunner.emit({ type: "agent_settled", ...event });
+			this._emit({ type: "agent_settled", ...event });
 		} finally {
 			this._resolveIdleWaitIfIdle();
 		}
@@ -1008,7 +1019,10 @@ export class AgentSession {
 	private async _emitExtensionEvent(event: AgentEvent): Promise<void> {
 		if (event.type === "agent_start") {
 			this._turnIndex = 0;
-			await this._extensionRunner.emit({ type: "agent_start" });
+			await this._extensionRunner.emit({
+				type: "agent_start",
+				operation: this._activeDurableOperation ? { ...this._activeDurableOperation } : undefined,
+			});
 		} else if (event.type === "agent_end") {
 			await this._extensionRunner.emit({ type: "agent_end", messages: event.messages });
 		} else if (event.type === "turn_start") {
@@ -1465,7 +1479,11 @@ export class AgentSession {
 				this._pendingDurablePreparedInput = undefined;
 				this._systemPromptOverride = undefined;
 				this._flushPendingBashMessages();
-				await this._emitAgentSettled();
+				await this._emitAgentSettled({
+					operation: durableOperation ? { ...durableOperation } : undefined,
+					outcome: operationSuspended ? "suspended" : outcome,
+					error: operationError,
+				});
 			}
 		}
 		if (deferredError) throw deferredError;
