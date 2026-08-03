@@ -202,7 +202,7 @@ interface RecordBase {
 // Acceptance boundary of an operation. Everything decided before acceptance
 // is persisted here. This record's own id IS the runId that all other
 // records of the operation carry.
-interface OperationStarted extends RecordBase {
+interface OperationStartedRecord extends RecordBase {
   type: "operation_started";
   sourceLeafId: string | null;        // the lane's leaf at acceptance
   intent:
@@ -241,7 +241,7 @@ interface OperationStarted extends RecordBase {
 // Written when abort() resolves. A request marker, not a terminal state:
 // reconciliation follows, then operation_finished with outcome "aborted".
 // Kills this operation's steer/follow-up queue items; next-run items survive.
-interface AbortRequested extends RecordBase {
+interface AbortRequestedRecord extends RecordBase {
   type: "abort_requested";
   runId: string;
   reason: "user" | "shutdown";
@@ -250,7 +250,7 @@ interface AbortRequested extends RecordBase {
 // Closes the operation. failed = orderly durable failure (for example,
 // retries exhausted). aborted = closed by abort. declined = vetoed by a
 // hook before any effect.
-interface OperationFinished extends RecordBase {
+interface OperationFinishedRecord extends RecordBase {
   type: "operation_finished";
   runId: string;
   outcome: "completed" | "aborted" | "failed" | "declined";
@@ -264,7 +264,7 @@ interface OperationFinished extends RecordBase {
 // may make zero or several provider requests (hook-supplied summaries make
 // none, split-turn compaction makes two). Deferred results need no extra
 // record: the handle lives in the persisted assistant entry (section 1).
-interface TaskAttempt extends RecordBase {
+interface TaskAttemptRecord extends RecordBase {
   type: "task_attempt";
   runId: string;
   task: "step" | "compaction" | "branch_summary";
@@ -280,7 +280,7 @@ interface TaskAttempt extends RecordBase {
 
 // Written after before_tool and validation pass, before the tool executes.
 // assistantEntryId + toolIndex is the durable invocation identity.
-interface ToolStarted extends RecordBase {
+interface ToolStartedRecord extends RecordBase {
   type: "tool_started";
   runId: string;
   assistantEntryId: string;
@@ -298,7 +298,7 @@ interface ToolStarted extends RecordBase {
 
 // Queue acceptance. The payload travels here; the entry appears at the
 // consumption point.
-interface QueueEnqueued extends RecordBase {
+interface QueueEnqueuedRecord extends RecordBase {
   type: "queue_enqueued";
   queue: "steer" | "followUp" | "nextRun";
   runId?: string;                      // absent for nextRun
@@ -308,7 +308,7 @@ interface QueueEnqueued extends RecordBase {
 // Durable retraction of a pending queue item, before consumption. Without
 // this record a crash would resurrect the item: recovery treats a
 // queue_enqueued without its entry as pending.
-interface QueueCancelled extends RecordBase {
+interface QueueCancelledRecord extends RecordBase {
   type: "queue_cancelled";
   runId?: string;                      // matches the queue_enqueued it kills
   entryId: string;                     // the enqueued target's provisioned id
@@ -316,14 +316,14 @@ interface QueueCancelled extends RecordBase {
 
 // Deferred-write acceptance: an entry or configuration change requested
 // while a step was in flight. Applied at the next checkpoint.
-interface WriteDeferred extends RecordBase {
+interface WriteDeferredRecord extends RecordBase {
   type: "write_deferred";
   runId: string;
   target: ProvisionedEntry;
 }
 
-type LaneRecord = OperationStarted | AbortRequested | OperationFinished
-  | TaskAttempt | ToolStarted | QueueEnqueued | QueueCancelled | WriteDeferred;
+type LaneRecord = OperationStartedRecord | AbortRequestedRecord | OperationFinishedRecord
+  | TaskAttemptRecord | ToolStartedRecord | QueueEnqueuedRecord | QueueCancelledRecord | WriteDeferredRecord;
 
 type NewRecord<T extends LaneRecord = LaneRecord> =
   T extends LaneRecord ? Omit<T, "seq" | "timestamp"> : never;
@@ -1819,7 +1819,7 @@ interface LaneState {
   operation: null | {
     id: string;
     kind: "run" | "compaction" | "navigation";
-    intent: OperationStarted["intent"];
+    intent: OperationStartedRecord["intent"];
     aborting: boolean;
     task: null | {                          // unfinished task: attempts newer than newest own entry
       kind: "step" | "compaction" | "branch_summary";
@@ -1845,7 +1845,7 @@ interface ToolBatchState {
   calls: {                                  // original source order and ordinals
     toolIndex: number;
     toolCall: AgentToolCall;
-    started?: ToolStarted;
+    started?: ToolStartedRecord;
     resultExists: boolean;
     terminate?: boolean;                    // persisted on the result entry
   }[];
@@ -2066,7 +2066,7 @@ function* toolBatchMachine(state: LaneState, assistant: AssistantMessage): Machi
     return;
   }
 
-  const open: { prepared: PreparedToolCall; started: ToolStarted }[] = [];
+  const open: { prepared: PreparedToolCall; started: ToolStartedRecord }[] = [];
   for (const [toolIndex, toolCall] of toolCalls(assistant).entries()) {
     const prepared = prepareToolCallPure(toolCall, activeTools(state));   // pure phase 1
     if (prepared.kind === "immediate") {                     // unknown tool, invalid args
