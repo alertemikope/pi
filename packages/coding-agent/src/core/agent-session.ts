@@ -69,6 +69,7 @@ import {
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import {
 	acquireDurableOperationLease,
+	type DurableEffectClaim,
 	type DurableOperationHandle,
 	DurableOperationJournal,
 	type DurableOperationLease,
@@ -780,6 +781,25 @@ export class AgentSession {
 						this._emitQueueUpdate();
 					}
 				}
+			}
+		}
+
+		if (this._durableOperations && this._activeDurableOperation) {
+			if (event.type === "tool_execution_start") {
+				const identity = this._pendingDurableToolIdentities.get(event.toolCallId)?.[0];
+				if (!identity) {
+					throw new Error(`Missing durable assistant entry identity for tool call ${event.toolCallId}`);
+				}
+				const reservation = this._durableOperations.reserveEffect(this._activeDurableOperation, {
+					assistantEntryId: identity.assistantEntryId,
+					toolIndex: identity.toolIndex,
+					toolCallId: event.toolCallId,
+					toolName: event.toolName,
+				});
+				if (this._durableEffectKeys.has(event.toolCallId)) {
+					throw new Error(`Duplicate active durable tool call id ${event.toolCallId}`);
+				}
+				this._durableEffectKeys.set(event.toolCallId, reservation.key);
 			}
 		}
 
@@ -1527,10 +1547,12 @@ export class AgentSession {
 							addedToolNames?: string[];
 						})
 					: undefined;
-			const interrupted = effect.status === "running" || effect.status === "uncertain";
-			const fallbackText = interrupted
-				? "Tool execution was interrupted. Its external outcome is unknown; inspect current state before retrying."
-				: effect.error || `Recovered ${effect.toolName} result was unavailable.`;
+			const fallbackText =
+				effect.status === "reserved"
+					? "Tool execution was interrupted before dispatch; no external effect occurred."
+					: effect.status === "dispatched" || effect.status === "unresolved"
+						? "Tool execution was interrupted. Its external outcome is unknown; inspect current state before retrying."
+						: effect.error || `Recovered ${effect.toolName} result was unavailable.`;
 			const toolResult: ToolResultMessage<unknown> = {
 				role: "toolResult",
 				toolCallId: effect.toolCallId,
@@ -3049,22 +3071,21 @@ export class AgentSession {
 					toolCallId,
 					(this._durableToolExecutionsAwaitingEnd.get(toolCallId) ?? 0) + 1,
 				);
-				const claim = journal.claimEffect(operation, {
-					assistantEntryId: identity.assistantEntryId,
-					toolIndex: identity.toolIndex,
-					toolCallId,
-					toolName: tool.name,
-					args: params,
-					replay,
-				});
+				const effectKey = this._durableEffectKeys.get(toolCallId);
+				if (!effectKey) {
+					throw new Error(`Missing durable effect reservation for tool call ${toolCallId}`);
+				}
+				let claim: DurableEffectClaim;
+				try {
+					claim = journal.dispatchEffect(operation, effectKey, { args: params, replay });
+				} catch (error) {
+					this._durableEffectKeys.delete(toolCallId);
+					throw error;
+				}
 				if (claim.kind === "reuse") {
+					this._durableEffectKeys.delete(toolCallId);
 					return claim.result as AgentToolResult<unknown>;
 				}
-
-				if (this._durableEffectKeys.has(toolCallId)) {
-					throw new Error(`Duplicate active durable tool call id ${toolCallId}`);
-				}
-				this._durableEffectKeys.set(toolCallId, claim.key);
 				return await execute(toolCallId, params, signal, onUpdate);
 			},
 		};

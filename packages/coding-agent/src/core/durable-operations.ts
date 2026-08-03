@@ -17,7 +17,7 @@ import { dirname, join, resolve } from "node:path";
 export type DurableOperationStatus = "accepted" | "running" | "suspended" | "completed" | "failed" | "aborted";
 export type DurableOperationOutcome = Extract<DurableOperationStatus, "completed" | "failed" | "aborted">;
 export type DurableReplayPolicy = "safe" | "never";
-export type DurableEffectStatus = "running" | "completed" | "failed" | "uncertain";
+export type DurableEffectStatus = "reserved" | "dispatched" | "completed" | "failed" | "unresolved";
 
 export interface DurableOperationHandle {
 	id: string;
@@ -31,8 +31,8 @@ export interface DurableEffectSnapshot {
 	toolIndex: number;
 	toolCallId: string;
 	toolName: string;
-	argsHash: string;
-	replay: DurableReplayPolicy;
+	argsHash?: string;
+	replay?: DurableReplayPolicy;
 	resultEntryId: string;
 	status: DurableEffectStatus;
 	result?: unknown;
@@ -72,6 +72,29 @@ type DurableRecord =
 	| (DurableRecordBase & { type: "prepared_updated"; prepared: DurablePreparedInput })
 	| (DurableRecordBase & { type: "task_attempt"; attempt: number; recovered: boolean })
 	| (DurableRecordBase & { type: "checkpoint"; kind: string; data?: unknown })
+	| (DurableRecordBase & {
+			type: "tool_reserved";
+			key: string;
+			assistantEntryId: string;
+			toolIndex: number;
+			toolCallId: string;
+			toolName: string;
+			resultEntryId: string;
+	  })
+	| (DurableRecordBase & {
+			type: "tool_dispatched";
+			key: string;
+			argsHash: string;
+			replay: DurableReplayPolicy;
+	  })
+	| (DurableRecordBase & {
+			type: "tool_settled";
+			key: string;
+			status: "completed" | "failed";
+			result?: unknown;
+			error?: string;
+	  })
+	// Legacy schema-1 records written before reservation and dispatch were split.
 	| (DurableRecordBase & {
 			type: "tool_started";
 			key: string;
@@ -403,6 +426,30 @@ function isDurableRecord(value: unknown): value is DurableRecord {
 			);
 		case "checkpoint":
 			return typeof record.kind === "string" && record.kind.length > 0;
+		case "tool_reserved":
+			return (
+				typeof record.key === "string" &&
+				record.key.length > 0 &&
+				typeof record.assistantEntryId === "string" &&
+				record.assistantEntryId.length > 0 &&
+				typeof record.toolIndex === "number" &&
+				Number.isInteger(record.toolIndex) &&
+				record.toolIndex >= 0 &&
+				typeof record.toolCallId === "string" &&
+				record.toolCallId.length > 0 &&
+				typeof record.toolName === "string" &&
+				record.toolName.length > 0 &&
+				typeof record.resultEntryId === "string" &&
+				record.resultEntryId.length > 0
+			);
+		case "tool_dispatched":
+			return (
+				typeof record.key === "string" &&
+				record.key.length > 0 &&
+				typeof record.argsHash === "string" &&
+				record.argsHash.length > 0 &&
+				(record.replay === "safe" || record.replay === "never")
+			);
 		case "tool_started":
 			return (
 				typeof record.key === "string" &&
@@ -422,6 +469,7 @@ function isDurableRecord(value: unknown): value is DurableRecord {
 				typeof record.resultEntryId === "string" &&
 				record.resultEntryId.length > 0
 			);
+		case "tool_settled":
 		case "tool_finished":
 			return (
 				typeof record.key === "string" &&
@@ -500,7 +548,7 @@ export class DurableOperationJournal {
 		}
 
 		for (const effect of operation.effects) {
-			if (effect.status === "running") {
+			if (effect.status === "dispatched") {
 				this.append({
 					type: "tool_interrupted",
 					operationId: operation.id,
@@ -625,9 +673,20 @@ export class DurableOperationJournal {
 			replay: DurableReplayPolicy;
 		},
 	): DurableEffectClaim {
+		const reservation = this.reserveEffect(operation, input);
+		return this.dispatchEffect(operation, reservation.key, { args: input.args, replay: input.replay });
+	}
+
+	reserveEffect(
+		operation: DurableOperationHandle,
+		input: {
+			assistantEntryId: string;
+			toolIndex: number;
+			toolCallId: string;
+			toolName: string;
+		},
+	): { key: string; resultEntryId: string } {
 		const snapshot = this.requireOpen(operation.id);
-		const argsJson = canonicalJson(input.args);
-		const argsHash = hash(argsJson);
 		const key = `effect:${hash(`${operation.id}\0${input.assistantEntryId}\0${input.toolIndex}`)}`;
 		const exact = snapshot.effects.find((effect) => effect.key === key);
 		if (exact) {
@@ -635,38 +694,16 @@ export class DurableOperationJournal {
 				exact.assistantEntryId !== input.assistantEntryId ||
 				exact.toolIndex !== input.toolIndex ||
 				exact.toolCallId !== input.toolCallId ||
-				exact.toolName !== input.toolName ||
-				exact.argsHash !== argsHash
+				exact.toolName !== input.toolName
 			) {
 				throw new Error(`Durable effect identity mismatch for tool call ${input.toolCallId}`);
 			}
-			if (
-				operation.recovered &&
-				exact.replay === "safe" &&
-				input.replay === "safe" &&
-				exact.status !== "completed"
-			) {
-				this.append({
-					type: "tool_started",
-					operationId: operation.id,
-					sessionId: this.sessionId,
-					key,
-					assistantEntryId: input.assistantEntryId,
-					toolIndex: input.toolIndex,
-					toolCallId: input.toolCallId,
-					toolName: input.toolName,
-					argsHash,
-					replay: input.replay,
-					resultEntryId: exact.resultEntryId,
-				});
-				return { kind: "execute", key, resultEntryId: exact.resultEntryId };
-			}
-			return this.resolveExistingEffect(operation, key, exact);
+			return { key, resultEntryId: exact.resultEntryId };
 		}
 
 		const resultEntryId = `tool-result:${hash(`${key}\0result`).slice(0, 32)}`;
 		this.append({
-			type: "tool_started",
+			type: "tool_reserved",
 			operationId: operation.id,
 			sessionId: this.sessionId,
 			key,
@@ -674,11 +711,51 @@ export class DurableOperationJournal {
 			toolIndex: input.toolIndex,
 			toolCallId: input.toolCallId,
 			toolName: input.toolName,
-			argsHash,
-			replay: input.replay,
 			resultEntryId,
 		});
-		return { kind: "execute", key, resultEntryId };
+		return { key, resultEntryId };
+	}
+
+	dispatchEffect(
+		operation: DurableOperationHandle,
+		key: string,
+		input: { args: unknown; replay: DurableReplayPolicy },
+	): DurableEffectClaim {
+		const snapshot = this.requireOpen(operation.id);
+		const argsJson = canonicalJson(input.args);
+		const argsHash = hash(argsJson);
+		const exact = snapshot.effects.find((effect) => effect.key === key);
+		if (!exact) {
+			throw new Error(`Cannot dispatch unknown durable effect ${key}`);
+		}
+		if (exact.argsHash !== undefined && exact.argsHash !== argsHash) {
+			throw new Error(`Durable effect identity mismatch for tool call ${exact.toolCallId}`);
+		}
+		if (exact.status === "completed" || exact.status === "failed") {
+			return this.resolveExistingEffect(operation, key, exact);
+		}
+		if (exact.status === "dispatched") {
+			throw new Error(`External effect ${key} was already dispatched.`);
+		}
+		if (exact.status === "unresolved") {
+			if (
+				!operation.recovered ||
+				exact.replay !== "safe" ||
+				input.replay !== "safe" ||
+				exact.argsHash !== argsHash
+			) {
+				throw new Error(`External effect ${key} is unresolved; inspect current state before attempting it again.`);
+			}
+		}
+		this.append({
+			type: "tool_dispatched",
+			operationId: operation.id,
+			sessionId: this.sessionId,
+			key,
+			argsHash,
+			replay: input.replay,
+		});
+		return { kind: "execute", key, resultEntryId: exact.resultEntryId };
 	}
 
 	finishEffect(
@@ -690,7 +767,7 @@ export class DurableOperationJournal {
 	): void {
 		this.requireOpen(operation.id);
 		this.append({
-			type: "tool_finished",
+			type: "tool_settled",
 			operationId: operation.id,
 			sessionId: this.sessionId,
 			key,
@@ -724,9 +801,10 @@ export class DurableOperationJournal {
 			throw new Error(`Durable operation ${operation.id} already finished with ${current.status}`);
 		}
 		if (
-			current.status === "running" &&
 			current.effects.some(
-				(effect) => (effect.status === "running" || effect.status === "uncertain") && !effect.reconciled,
+				(effect) =>
+					(effect.status === "reserved" || effect.status === "dispatched" || effect.status === "unresolved") &&
+					!effect.reconciled,
 			)
 		) {
 			throw new Error(`Durable operation ${operation.id} still has an unresolved external effect`);
@@ -932,6 +1010,34 @@ export class DurableOperationJournal {
 			}
 			return;
 		}
+		if (record.type === "tool_reserved") {
+			if (operation.status !== "running") {
+				throw new Error(
+					`Cannot reserve a durable effect while operation ${record.operationId} is ${operation.status}`,
+				);
+			}
+			if (operationEffects.has(record.key)) {
+				throw new Error(`Durable effect ${record.key} was already reserved`);
+			}
+			return;
+		}
+		if (record.type === "tool_dispatched") {
+			const effect = operationEffects.get(record.key);
+			if (operation.status !== "running" || !effect) {
+				throw new Error(`Dispatch does not match a reserved durable effect ${record.key}`);
+			}
+			if (effect.status === "reserved") return;
+			if (
+				operation.attempt <= 1 ||
+				effect.status !== "unresolved" ||
+				effect.replay !== "safe" ||
+				record.replay !== "safe" ||
+				effect.argsHash !== record.argsHash
+			) {
+				throw new Error(`Invalid durable effect replay for ${record.key}`);
+			}
+			return;
+		}
 		if (record.type === "tool_started") {
 			if (operation.status !== "running") {
 				throw new Error(
@@ -954,29 +1060,33 @@ export class DurableOperationJournal {
 			if (
 				operation.attempt <= 1 ||
 				record.replay !== "safe" ||
-				(existing.status !== "uncertain" && existing.status !== "failed")
+				(existing.status !== "unresolved" && existing.status !== "failed")
 			) {
 				throw new Error(`Invalid durable effect replay for ${record.key}`);
 			}
 			return;
 		}
-		if (record.type === "tool_finished") {
+		if (record.type === "tool_settled" || record.type === "tool_finished") {
 			const effect = operationEffects.get(record.key);
-			if (operation.status !== "running" || effect?.status !== "running") {
-				throw new Error(`Tool result does not match a running durable effect ${record.key}`);
+			const validStatus =
+				record.type === "tool_settled"
+					? effect?.status === "reserved" || effect?.status === "dispatched"
+					: effect?.status === "dispatched";
+			if (operation.status !== "running" || !validStatus) {
+				throw new Error(`Tool result does not match an active durable effect ${record.key}`);
 			}
 			return;
 		}
 		if (record.type === "tool_interrupted") {
 			const effect = operationEffects.get(record.key);
-			if (operation.status !== "running" || effect?.status !== "running") {
-				throw new Error(`Tool interruption does not match a running durable effect ${record.key}`);
+			if (operation.status !== "running" || effect?.status !== "dispatched") {
+				throw new Error(`Tool interruption does not match a dispatched durable effect ${record.key}`);
 			}
 			return;
 		}
 		if (record.type === "tool_reconciled") {
 			const effect = operationEffects.get(record.key);
-			if (operation.status !== "suspended" || !effect || effect.status === "running" || effect.reconciled) {
+			if (operation.status !== "suspended" || !effect || effect.status === "dispatched" || effect.reconciled) {
 				throw new Error(`Invalid durable effect reconciliation for ${record.key}`);
 			}
 			return;
@@ -1027,9 +1137,10 @@ export class DurableOperationJournal {
 				throw new Error(`Cannot finish durable operation ${record.operationId} while ${operation.status}`);
 			}
 			if (
-				operation.status === "running" &&
 				[...operationEffects.values()].some(
-					(effect) => (effect.status === "running" || effect.status === "uncertain") && !effect.reconciled,
+					(effect) =>
+						(effect.status === "reserved" || effect.status === "dispatched" || effect.status === "unresolved") &&
+						!effect.reconciled,
 				)
 			) {
 				throw new Error(`Durable operation ${record.operationId} still has an unresolved external effect`);
@@ -1082,6 +1193,27 @@ export class DurableOperationJournal {
 				data: record.data,
 				at: record.at,
 			};
+		} else if (record.type === "tool_reserved") {
+			operationEffects.set(record.key, {
+				key: record.key,
+				assistantEntryId: record.assistantEntryId,
+				toolIndex: record.toolIndex,
+				toolCallId: record.toolCallId,
+				toolName: record.toolName,
+				resultEntryId: record.resultEntryId,
+				status: "reserved",
+			});
+		} else if (record.type === "tool_dispatched") {
+			const effect = operationEffects.get(record.key);
+			if (!effect) {
+				throw new Error(`Tool dispatch references unknown effect ${record.key}`);
+			}
+			effect.argsHash = record.argsHash;
+			effect.replay = record.replay;
+			effect.status = "dispatched";
+			effect.result = undefined;
+			effect.error = undefined;
+			effect.reconciled = undefined;
 		} else if (record.type === "tool_started") {
 			operationEffects.set(record.key, {
 				key: record.key,
@@ -1092,9 +1224,9 @@ export class DurableOperationJournal {
 				argsHash: record.argsHash,
 				replay: record.replay,
 				resultEntryId: record.resultEntryId,
-				status: "running",
+				status: "dispatched",
 			});
-		} else if (record.type === "tool_finished") {
+		} else if (record.type === "tool_settled" || record.type === "tool_finished") {
 			const effect = operationEffects.get(record.key);
 			if (!effect) {
 				throw new Error(`Tool result references unknown effect ${record.key}`);
@@ -1107,7 +1239,7 @@ export class DurableOperationJournal {
 			if (!effect) {
 				throw new Error(`Tool interruption references unknown effect ${record.key}`);
 			}
-			effect.status = "uncertain";
+			effect.status = "unresolved";
 		} else if (record.type === "tool_reconciled") {
 			const effect = operationEffects.get(record.key);
 			if (!effect) {
@@ -1119,8 +1251,8 @@ export class DurableOperationJournal {
 			operation.error = record.error;
 			this.resumeRequests.delete(record.operationId);
 			for (const effect of operationEffects.values()) {
-				if (effect.status === "running") {
-					effect.status = "uncertain";
+				if (effect.status === "dispatched") {
+					effect.status = "unresolved";
 				}
 			}
 		} else if (record.type === "resume_requested") {

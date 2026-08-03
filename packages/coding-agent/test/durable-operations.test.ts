@@ -57,7 +57,7 @@ describe("DurableOperationJournal", () => {
 		});
 	});
 
-	it("suspends an interrupted operation and marks an in-flight mutation uncertain", () => {
+	it("suspends an interrupted operation and marks a dispatched mutation unresolved", () => {
 		const journal = createJournal();
 		const operation = journal.begin("Deploy the project");
 		journal.claimEffect(operation, {
@@ -70,7 +70,7 @@ describe("DurableOperationJournal", () => {
 		const restarted = new DurableOperationJournal(journal.path, journal.sessionId);
 		const suspended = restarted.recoverInFlight();
 		expect(suspended?.status).toBe("suspended");
-		expect(suspended?.effects[0]?.status).toBe("uncertain");
+		expect(suspended?.effects[0]?.status).toBe("unresolved");
 
 		const resumed = restarted.resume().operation;
 		expect(() =>
@@ -81,6 +81,46 @@ describe("DurableOperationJournal", () => {
 				replay: "never",
 			}),
 		).toThrow(/inspect current state/);
+	});
+
+	it("distinguishes a reserved tool call from a dispatched external effect", () => {
+		const journal = createJournal();
+		const operation = journal.begin("Deploy only after dispatch");
+		const reservation = journal.reserveEffect(operation, {
+			...invocation("call-1"),
+			toolName: "bash",
+		});
+
+		const restarted = new DurableOperationJournal(journal.path, journal.sessionId);
+		const suspended = restarted.recoverInFlight();
+		expect(suspended?.effects[0]).toMatchObject({
+			key: reservation.key,
+			status: "reserved",
+		});
+
+		const resumed = restarted.resume().operation;
+		expect(
+			restarted.dispatchEffect(resumed, reservation.key, {
+				args: { command: "deploy" },
+				replay: "never",
+			}),
+		).toMatchObject({ kind: "execute", key: reservation.key });
+	});
+
+	it("settles validation and policy failures without dispatching externally", () => {
+		const journal = createJournal();
+		const operation = journal.begin("Reject an invalid call");
+		const reservation = journal.reserveEffect(operation, {
+			...invocation("call-1"),
+			toolName: "missing",
+		});
+		journal.finishEffect(operation, reservation.key, "failed", { content: [{ type: "text", text: "missing" }] });
+
+		const effect = journal.get(operation.id)?.effects[0];
+		expect(effect).toMatchObject({ status: "failed" });
+		expect(effect?.argsHash).toBeUndefined();
+		expect(effect?.replay).toBeUndefined();
+		expect(() => journal.finish(operation, "failed", "invalid tool")).not.toThrow();
 	});
 
 	it("recovers a crash between operation acceptance and the first task attempt", () => {
@@ -182,7 +222,7 @@ describe("DurableOperationJournal", () => {
 		expect(restarted.resume().operation).toMatchObject({ attempt: 2, recovered: true });
 	});
 
-	it("atomically makes running effects uncertain when an operation is suspended", () => {
+	it("atomically makes dispatched effects unresolved when an operation is suspended", () => {
 		const journal = createJournal();
 		const operation = journal.begin("Suspend a mutation");
 		const claim = journal.claimEffect(operation, {
@@ -195,15 +235,31 @@ describe("DurableOperationJournal", () => {
 
 		expect(journal.suspend(operation, "provider failed")).toMatchObject({
 			status: "suspended",
-			effects: [{ status: "uncertain" }],
+			effects: [{ status: "unresolved" }],
 		});
 
 		const restarted = new DurableOperationJournal(journal.path, journal.sessionId);
 		expect(restarted.recoverInFlight()).toMatchObject({
 			status: "suspended",
-			effects: [{ status: "uncertain" }],
+			effects: [{ status: "unresolved" }],
 		});
 		expect(() => restarted.markEffectReconciled(operation.id, claim.key)).not.toThrow();
+	});
+
+	it("refuses to abort suspended unresolved effects before reconciliation", () => {
+		const journal = createJournal();
+		const operation = journal.begin("Do not hide an uncertain deployment");
+		journal.claimEffect(operation, {
+			...invocation("call-1"),
+			toolName: "bash",
+			args: { command: "deploy" },
+			replay: "never",
+		});
+		const suspended = journal.suspend(operation, "process interrupted");
+
+		expect(() => journal.abortSuspended()).toThrow(/unresolved external effect/);
+		journal.markEffectReconciled(operation.id, suspended.effects[0]!.key);
+		expect(journal.abortSuspended()).toMatchObject({ status: "aborted" });
 	});
 
 	it("refuses every terminal outcome while an external effect is unresolved", () => {
@@ -221,7 +277,7 @@ describe("DurableOperationJournal", () => {
 		}
 		expect(journal.suspend(operation, "interrupted observer")).toMatchObject({
 			status: "suspended",
-			effects: [{ status: "uncertain" }],
+			effects: [{ status: "unresolved" }],
 		});
 	});
 
@@ -454,7 +510,7 @@ describe("DurableOperationJournal", () => {
 		reopened.close();
 	});
 
-	it("persists prepared input and requires uncertain effects to be reconciled before completion", () => {
+	it("persists prepared input and requires unresolved effects to be reconciled before completion", () => {
 		const journal = createJournal();
 		const prepared = {
 			messages: [{ role: "user", content: "original", timestamp: 1 }],

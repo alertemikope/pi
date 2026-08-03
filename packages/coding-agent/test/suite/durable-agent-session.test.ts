@@ -58,8 +58,9 @@ describe("durable AgentSession integration", () => {
 				expect.arrayContaining([
 					"operation_started",
 					"task_attempt",
-					"tool_started",
-					"tool_finished",
+					"tool_reserved",
+					"tool_dispatched",
+					"tool_settled",
 					"checkpoint",
 					"operation_finished",
 				]),
@@ -102,7 +103,7 @@ describe("durable AgentSession integration", () => {
 				.trim()
 				.split("\n")
 				.map((line) => JSON.parse(line) as { type: string; replay?: string });
-			expect(records.find((record) => record.type === "tool_started")?.replay).toBe("never");
+			expect(records.find((record) => record.type === "tool_dispatched")?.replay).toBe("never");
 		} finally {
 			harness.cleanup();
 		}
@@ -261,7 +262,7 @@ describe("durable AgentSession integration", () => {
 			).toHaveLength(1);
 			expect(journal.get(operation.id)).toMatchObject({
 				status: "aborted",
-				effects: [{ status: "uncertain", reconciled: true }],
+				effects: [{ status: "unresolved", reconciled: true }],
 			});
 			harness.setResponses([() => fauxAssistantMessage("continued after abort")]);
 			await harness.session.prompt("continue with new work");
@@ -289,7 +290,7 @@ describe("durable AgentSession integration", () => {
 			expect(() => harness.session.abortSuspendedOperation()).toThrow(/originating assistant message is missing/);
 			expect(journal.get(operation.id)).toMatchObject({
 				status: "suspended",
-				effects: [{ status: "uncertain" }],
+				effects: [{ status: "unresolved" }],
 			});
 		} finally {
 			harness.cleanup();
@@ -576,7 +577,16 @@ describe("durable AgentSession integration", () => {
 			expect(executions).toBe(1);
 			expect(assistantEntries).toHaveLength(2);
 			expect(durableJournal(harness.session).list().at(-1)?.effects).toEqual([
-				expect.objectContaining({ assistantEntryId: assistantEntries[1]?.id, toolCallId: "same" }),
+				expect.objectContaining({
+					assistantEntryId: assistantEntries[0]?.id,
+					toolCallId: "same",
+					status: "failed",
+				}),
+				expect.objectContaining({
+					assistantEntryId: assistantEntries[1]?.id,
+					toolCallId: "same",
+					status: "completed",
+				}),
 			]);
 		} finally {
 			harness.cleanup();
