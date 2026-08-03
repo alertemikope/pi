@@ -121,6 +121,7 @@ export type {
 	MessageRenderOptions,
 	MessageStartEvent,
 	MessageUpdateEvent,
+	ProcessTermination,
 	ProjectTrustContext,
 	ProjectTrustEvent,
 	ProjectTrustEventDecision,
@@ -342,6 +343,13 @@ export {
 	type ProjectTrustStoreEntry,
 	type ProjectTrustUpdate,
 } from "./core/trust-manager.ts";
+export {
+	isVerificationReceipt,
+	runHostVerification,
+	type VerificationCheck,
+	type VerificationOutputEvidence,
+	type VerificationReceipt,
+} from "./core/verification.ts";
 // Main entry point
 export { type MainOptions, main } from "./main.ts";
 // Run modes for programmatic SDK usage

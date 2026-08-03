@@ -13,6 +13,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { isVerificationReceipt, type VerificationReceipt } from "./verification.ts";
 
 export type DurableOperationStatus = "accepted" | "running" | "suspended" | "completed" | "failed" | "aborted";
 export type DurableOperationOutcome = Extract<DurableOperationStatus, "completed" | "failed" | "aborted">;
@@ -56,6 +57,7 @@ export interface DurableOperationSnapshot {
 	checkpointCount: number;
 	lastCheckpoint?: { kind: string; data?: unknown; at: number };
 	effects: DurableEffectSnapshot[];
+	verificationReceipts: VerificationReceipt[];
 	prepared?: DurablePreparedInput;
 	error?: string;
 }
@@ -116,6 +118,7 @@ type DurableRecord =
 	| (DurableRecordBase & { type: "tool_interrupted"; key: string })
 	| (DurableRecordBase & { type: "tool_reconciled"; key: string })
 	| (DurableRecordBase & { type: "tool_reused"; key: string; sourceKey: string })
+	| (DurableRecordBase & { type: "verification_recorded"; receipt: VerificationReceipt })
 	| (DurableRecordBase & { type: "operation_suspended"; error: string })
 	| (DurableRecordBase & { type: "resume_requested"; attempt: number })
 	| (DurableRecordBase & { type: "abort_requested"; reason: string })
@@ -379,6 +382,7 @@ function cloneSnapshot(snapshot: DurableOperationSnapshot): DurableOperationSnap
 				}
 			: undefined,
 		effects: snapshot.effects.map((effect) => cloneEffect(effect)),
+		verificationReceipts: cloneJson(snapshot.verificationReceipts) as VerificationReceipt[],
 	};
 }
 
@@ -487,6 +491,8 @@ function isDurableRecord(value: unknown): value is DurableRecord {
 				typeof record.sourceKey === "string" &&
 				record.sourceKey.length > 0
 			);
+		case "verification_recorded":
+			return isVerificationReceipt(record.receipt);
 		case "operation_suspended":
 			return typeof record.error === "string";
 		case "resume_requested":
@@ -774,6 +780,19 @@ export class DurableOperationJournal {
 			status,
 			result: result === undefined ? undefined : cloneJson(result),
 			error,
+		});
+	}
+
+	recordVerification(operation: DurableOperationHandle, receipt: VerificationReceipt): void {
+		this.requireOpen(operation.id);
+		if (receipt.operationId !== operation.id || receipt.sessionId !== this.sessionId) {
+			throw new Error(`Verification receipt ${receipt.id} does not belong to durable operation ${operation.id}`);
+		}
+		this.append({
+			type: "verification_recorded",
+			operationId: operation.id,
+			sessionId: this.sessionId,
+			receipt: cloneJson(receipt) as VerificationReceipt,
 		});
 	}
 
@@ -1105,6 +1124,17 @@ export class DurableOperationJournal {
 			}
 			return;
 		}
+		if (record.type === "verification_recorded") {
+			if (
+				operation.status !== "running" ||
+				record.receipt.operationId !== record.operationId ||
+				record.receipt.sessionId !== record.sessionId ||
+				operation.verificationReceipts.some((receipt) => receipt.id === record.receipt.id)
+			) {
+				throw new Error(`Invalid verification receipt ${record.receipt.id}`);
+			}
+			return;
+		}
 		if (record.type === "operation_suspended") {
 			const legacyInterruptedResume =
 				operation.status === "suspended" && this.resumeRequests.has(record.operationId);
@@ -1160,6 +1190,7 @@ export class DurableOperationJournal {
 				updatedAt: record.at,
 				checkpointCount: 0,
 				effects: [],
+				verificationReceipts: [],
 				prepared: record.prepared
 					? {
 							messages: cloneJson(record.prepared.messages) as unknown[],
@@ -1246,6 +1277,8 @@ export class DurableOperationJournal {
 				throw new Error(`Tool reconciliation references unknown effect ${record.key}`);
 			}
 			effect.reconciled = true;
+		} else if (record.type === "verification_recorded") {
+			operation.verificationReceipts.push(cloneJson(record.receipt) as VerificationReceipt);
 		} else if (record.type === "operation_suspended") {
 			operation.status = "suspended";
 			operation.error = record.error;

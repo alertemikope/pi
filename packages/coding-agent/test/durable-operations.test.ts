@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { acquireDurableOperationLease, DurableOperationJournal } from "../src/core/durable-operations.ts";
+import { runHostVerification } from "../src/core/verification.ts";
 
 function invocation(toolCallId: string, assistantEntryId = "assistant-1", toolIndex = 0) {
 	return { assistantEntryId, toolIndex, toolCallId };
@@ -121,6 +122,20 @@ describe("DurableOperationJournal", () => {
 		expect(effect?.argsHash).toBeUndefined();
 		expect(effect?.replay).toBeUndefined();
 		expect(() => journal.finish(operation, "failed", "invalid tool")).not.toThrow();
+	});
+
+	it("persists host verification receipts independently of transcript entries", async () => {
+		const journal = createJournal();
+		const operation = journal.begin("Verify the project");
+		const receipt = await runHostVerification(
+			{ sessionId: journal.sessionId, operationId: operation.id, cwd: process.cwd() },
+			{ id: "check", command: process.execPath, args: ["-e", "process.stdout.write('ok')"] },
+		);
+		journal.recordVerification(operation, receipt);
+		journal.finish(operation, "completed");
+
+		const restarted = new DurableOperationJournal(journal.path, journal.sessionId);
+		expect(restarted.get(operation.id)?.verificationReceipts).toEqual([receipt]);
 	});
 
 	it("recovers a crash between operation acceptance and the first task attempt", () => {

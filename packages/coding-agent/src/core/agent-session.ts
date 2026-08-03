@@ -125,6 +125,7 @@ import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts"
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
+import { runHostVerification, type VerificationCheck, type VerificationReceipt } from "./verification.ts";
 
 // ============================================================================
 // Skill Block Parsing
@@ -1448,6 +1449,25 @@ export class AgentSession {
 	getSuspendedOperation(): DurableOperationSnapshot | undefined {
 		const suspended = this._durableOperations?.latestSuspended() ?? this._suspendedDurableOperation;
 		return suspended ? { ...suspended, effects: suspended.effects.map((effect) => ({ ...effect })) } : undefined;
+	}
+
+	async runVerification(check: VerificationCheck, signal?: AbortSignal): Promise<VerificationReceipt> {
+		const journal = this._durableOperations;
+		const operation = this._activeDurableOperation;
+		if (!journal || !operation) {
+			throw new Error("Host verification requires an active durable operation.");
+		}
+		const receipt = await runHostVerification(
+			{
+				sessionId: this.sessionManager.getSessionId(),
+				operationId: operation.id,
+				cwd: this._cwd,
+				signal,
+			},
+			check,
+		);
+		journal.recordVerification(operation, receipt);
+		return receipt;
 	}
 
 	private _restorePreparedMessages(prepared: unknown[]): void {

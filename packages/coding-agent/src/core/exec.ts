@@ -23,9 +23,19 @@ export interface ExecOptions {
 export interface ExecResult {
 	stdout: string;
 	stderr: string;
+	termination: ProcessTermination;
+	/** @deprecated Use termination. Preserved for extension compatibility. */
 	code: number;
+	/** @deprecated Use termination. Preserved for extension compatibility. */
 	killed: boolean;
 }
+
+export type ProcessTermination =
+	| { kind: "exited"; code: number }
+	| { kind: "signaled"; signal: NodeJS.Signals | null }
+	| { kind: "aborted" }
+	| { kind: "timed_out"; timeoutMs: number }
+	| { kind: "spawn_error"; message: string };
 
 /**
  * Execute a shell command and return stdout/stderr/code.
@@ -48,34 +58,47 @@ export async function execCommand(
 		let stderr = "";
 		let killed = false;
 		let timeoutId: NodeJS.Timeout | undefined;
+		let forceKillId: NodeJS.Timeout | undefined;
+		let requestedTermination: Extract<ProcessTermination, { kind: "aborted" | "timed_out" }> | undefined;
+		let exitSignal: NodeJS.Signals | null = null;
+		let spawnError: Error | undefined;
 
-		const killProcess = () => {
+		const killProcess = (termination: Extract<ProcessTermination, { kind: "aborted" | "timed_out" }>) => {
 			if (!killed) {
 				killed = true;
+				requestedTermination = termination;
 				proc.kill("SIGTERM");
 				// Force kill after 5 seconds if SIGTERM doesn't work
-				setTimeout(() => {
-					if (!proc.killed) {
+				forceKillId = setTimeout(() => {
+					if (proc.exitCode === null && proc.signalCode === null) {
 						proc.kill("SIGKILL");
 					}
 				}, 5000);
 			}
 		};
+		const abortProcess = () => killProcess({ kind: "aborted" });
+		proc.once("exit", (_code, signal) => {
+			exitSignal = signal;
+		});
+		proc.once("error", (error) => {
+			spawnError = error;
+		});
 
 		// Handle abort signal
 		if (options?.signal) {
 			if (options.signal.aborted) {
-				killProcess();
+				abortProcess();
 			} else {
-				options.signal.addEventListener("abort", killProcess, { once: true });
+				options.signal.addEventListener("abort", abortProcess, { once: true });
 			}
 		}
 
 		// Handle timeout
-		if (options?.timeout && options.timeout > 0) {
+		const timeoutMs = options?.timeout;
+		if (timeoutMs && timeoutMs > 0) {
 			timeoutId = setTimeout(() => {
-				killProcess();
-			}, options.timeout);
+				killProcess({ kind: "timed_out", timeoutMs });
+			}, timeoutMs);
 		}
 
 		proc.stdout?.on("data", (data) => {
@@ -91,17 +114,39 @@ export async function execCommand(
 		waitForChildProcess(proc)
 			.then((code) => {
 				if (timeoutId) clearTimeout(timeoutId);
+				if (forceKillId) clearTimeout(forceKillId);
 				if (options?.signal) {
-					options.signal.removeEventListener("abort", killProcess);
+					options.signal.removeEventListener("abort", abortProcess);
 				}
-				resolve({ stdout, stderr, code: code ?? 0, killed });
+				const termination: ProcessTermination =
+					requestedTermination ??
+					(spawnError
+						? { kind: "spawn_error", message: spawnError.message }
+						: code === null
+							? { kind: "signaled", signal: exitSignal }
+							: { kind: "exited", code });
+				resolve({
+					stdout,
+					stderr,
+					termination,
+					code: termination.kind === "exited" ? termination.code : 1,
+					killed,
+				});
 			})
-			.catch((_err) => {
+			.catch((error: unknown) => {
 				if (timeoutId) clearTimeout(timeoutId);
+				if (forceKillId) clearTimeout(forceKillId);
 				if (options?.signal) {
-					options.signal.removeEventListener("abort", killProcess);
+					options.signal.removeEventListener("abort", abortProcess);
 				}
-				resolve({ stdout, stderr, code: 1, killed });
+				const message = error instanceof Error ? error.message : String(error);
+				resolve({
+					stdout,
+					stderr,
+					termination: requestedTermination ?? { kind: "spawn_error", message },
+					code: 1,
+					killed,
+				});
 			});
 	});
 }

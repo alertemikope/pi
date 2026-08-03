@@ -35,9 +35,27 @@ function setup(execResult: ExecResult) {
 
 describe("input-transform-streaming example", () => {
 	const diffOutput = " src/index.ts | 5 ++---\n 1 file changed, 2 insertions(+), 3 deletions(-)";
-	const gitSuccess: ExecResult = { stdout: diffOutput, stderr: "", code: 0, killed: false };
-	const gitEmpty: ExecResult = { stdout: "", stderr: "", code: 0, killed: false };
-	const gitFail: ExecResult = { stdout: "", stderr: "not a git repo", code: 128, killed: false };
+	const gitSuccess: ExecResult = {
+		stdout: diffOutput,
+		stderr: "",
+		termination: { kind: "exited", code: 0 },
+		code: 0,
+		killed: false,
+	};
+	const gitEmpty: ExecResult = {
+		stdout: "",
+		stderr: "",
+		termination: { kind: "exited", code: 0 },
+		code: 0,
+		killed: false,
+	};
+	const gitFail: ExecResult = {
+		stdout: "",
+		stderr: "not a git repo",
+		termination: { kind: "exited", code: 128 },
+		code: 128,
+		killed: false,
+	};
 
 	it("skips exec during steering", async () => {
 		const { emit, exec } = setup(gitSuccess);

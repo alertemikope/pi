@@ -148,6 +148,43 @@ describe("durable AgentSession integration", () => {
 		}
 	});
 
+	it("records host verification while a durable operation is active", async () => {
+		const harness = await createHarness({ persistentSession: true });
+		let releaseResponse: (() => void) | undefined;
+		let markStarted: (() => void) | undefined;
+		const responseGate = new Promise<void>((resolve) => {
+			releaseResponse = resolve;
+		});
+		const responseStarted = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+
+		try {
+			harness.setResponses([
+				async () => {
+					markStarted?.();
+					await responseGate;
+					return fauxAssistantMessage("done");
+				},
+			]);
+			const prompt = harness.session.prompt("verify while running");
+			await responseStarted;
+			const receipt = await harness.session.runVerification({
+				id: "host-check",
+				command: process.execPath,
+				args: ["-e", "process.stdout.write('ok')"],
+			});
+			releaseResponse?.();
+			await prompt;
+
+			expect(receipt.verdict).toBe("passed");
+			expect(durableJournal(harness.session).list().at(-1)?.verificationReceipts).toEqual([receipt]);
+		} finally {
+			releaseResponse?.();
+			harness.cleanup();
+		}
+	});
+
 	it("rejects a suspended prompt before extension input hooks and reports failed preflight", async () => {
 		let inputEvents = 0;
 		const harness = await createHarness({

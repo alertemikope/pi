@@ -73,6 +73,7 @@ export {
 	type InlineExtension,
 	type LoadExtensionsResult,
 	type MessageRenderer,
+	type ProcessTermination,
 	type RegisteredCommand,
 	type SessionBeforeCompactEvent,
 	type SessionBeforeForkEvent,
@@ -92,3 +93,10 @@ export {
 	type WorkingIndicatorOptions,
 } from "./extensions/index.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";
+export {
+	isVerificationReceipt,
+	runHostVerification,
+	type VerificationCheck,
+	type VerificationOutputEvidence,
+	type VerificationReceipt,
+} from "./verification.ts";
