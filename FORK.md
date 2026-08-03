@@ -12,10 +12,13 @@ Le fork est maintenu sur :
 
 ## Portée exacte
 
-Cette implémentation n'est pas le Harness v2 complet décrit dans
+Cette implémentation n'est pas encore le Harness v2 complet décrit dans
 [`packages/agent/docs/harness-v2.md`](packages/agent/docs/harness-v2.md).
-Ce document upstream est une conception cible. Le runtime upstream reste
-actuellement basé sur le Harness v1.
+Le fork intègre toutefois désormais le premier backend expérimental upstream :
+`SessionRepo`, le schéma des entrées et records, les lanes, le journal global,
+le backend mémoire et sa suite de conformité. Le runtime coding-agent reste
+temporairement adossé à son sidecar durable pendant la migration vers ce
+nouveau contrat.
 
 Le fork ajoute dès maintenant les propriétés suivantes au coding agent :
 
@@ -27,8 +30,11 @@ Le fork ajoute dès maintenant les propriétés suivantes au coding agent :
   fins de tour ;
 - un suivi des effets d'outils avec identité déterministe par
   `operationId + assistantEntryId + toolIndex` et hash des arguments ;
+- un cycle de vie explicite `reserved`, `dispatched`, `completed`, `failed` et
+  `unresolved`, qui distingue un outil connu comme non exécuté d'un effet dont
+  l'issue externe est incertaine ;
 - la détection d'une opération interrompue au prochain démarrage ;
-- le classement d'un effet en cours en `uncertain` après une interruption ;
+- le classement d'un effet dispatché en `unresolved` après une interruption ;
 - la réutilisation du résultat uniquement pour la même occurrence persistée
   d'appel d'outil, jamais par simple ressemblance du nom et des arguments ;
 - la persistance du lot de messages préparé et du system prompt réellement
@@ -43,11 +49,49 @@ Le fork ajoute dès maintenant les propriétés suivantes au coding agent :
   des forks/imports jusqu'à l'acquisition du verrou ;
 - une reprise opérateur avec `/recover` et un abandon avec
   `/recover abort`.
+- des receipts de vérification exécutés par le host, avec commande, cwd,
+  terminaison typée, hashes complets et extraits bornés de stdout/stderr ;
+- une classification structurée des erreurs assistant avec type, caractère
+  rejouable et action de récupération (`wait`, `compact`, `reauthenticate`,
+  `change_model`, etc.).
 
 Cette couche ne fournit pas encore les primitives complètes prévues par le
-design Harness v2 : `AgentHarness.create`, ledger partagé, lanes, handles
-d'opérations, abonnements `watch`, ordonnanceur multi-processus, stockage
-SQLite ou reprise exacte record-by-record de la génération du modèle.
+design Harness v2 : `AgentHarness.create`, ordonnanceur de lanes, abonnements
+`watch`, stockage JSONL/SQLite v4 ou reprise exacte record-by-record de la
+génération du modèle.
+
+## Avancement des trois phases
+
+### Phase 1 — durabilité
+
+Implémenté :
+
+- backend mémoire et suite de conformité Harness v2 ;
+- `StepAttemptRecord.resultEntryId` et ledger `UsageRecord` alignés sur le
+  design final ;
+- séparation durable réservation/dispatch/settlement des outils ;
+- refus d'abandonner un effet externe non réconcilié.
+
+Restant : diagnostics de sortie processus, reaper fail-closed, contrats de
+capacités persistés pour les subagents et vrais tests de crash par processus.
+
+### Phase 2 — fiabilité coding
+
+Implémenté : résultat processus discriminé et receipts de vérification
+host-attested persistés dans l'opération active.
+
+Restant : politique verify-on-stop, snapshots Git par opération, transactions
+de workspace et isolation worktree des lanes. Ces politiques resteront des
+extensions construites sur les primitives core.
+
+### Phase 3 — performance et observabilité
+
+Implémenté : ledger de coût Harness v2 et taxonomie structurée des échecs avec
+actions de récupération.
+
+Restant : comparaison du payload provider pour mesurer la stabilité du
+préfixe, journal de production séquencé, offsets durables des consommateurs et
+stockage CAS des payloads volumineux.
 
 ## Journal
 
@@ -91,11 +135,11 @@ Le dossier est créé avec le mode `0700` et le fichier avec le mode `0600`
 lorsque le système de fichiers prend en charge les permissions POSIX.
 
 Le journal contient notamment le prompt, les messages préparés, le system
-prompt, les noms et empreintes d'arguments des outils, leurs résultats finaux
-après hooks et les erreurs. Il doit être protégé comme le fichier de session
-lui-même et ne doit pas être publié sans vérification. Supprimer une session
-depuis le sélecteur Pi supprime ou met à la corbeille son sidecar exact ; les
-sidecars sont exclus de la liste des sessions.
+prompt, les réservations et dispatchs d'outils, leurs résultats finaux après
+hooks, les erreurs et les receipts de vérification. Il doit être protégé comme
+le fichier de session lui-même et ne doit pas être publié sans vérification.
+Supprimer une session depuis le sélecteur Pi supprime ou met à la corbeille son
+sidecar exact ; les sidecars sont exclus de la liste des sessions.
 
 Les sessions en mémoire ne créent pas de journal et ne proposent pas la
 reprise durable.
@@ -103,8 +147,9 @@ reprise durable.
 ## Reprise après interruption
 
 Si Pi s'arrête avant le checkpoint terminal, l'opération active devient
-`suspended` au prochain chargement de la session. Un outil commencé sans
-résultat enregistré devient `uncertain`, car Pi ne peut pas savoir si l'effet
+`suspended` au prochain chargement de la session. Un outil seulement réservé
+reste `reserved` et est connu comme non exécuté. Un outil dispatché sans
+résultat enregistré devient `unresolved`, car Pi ne peut pas savoir si l'effet
 externe a eu lieu avant l'arrêt.
 
 Dans le TUI :
@@ -122,8 +167,9 @@ Il vérifie aussi chaque appel d'outil déjà visible dans le transcript. Si le
 résultat final manque, Pi réinjecte exactement une entrée `toolResult` :
 
 - le résultat final journalisé pour un effet terminé ;
-- une erreur synthétique demandant une inspection pour un effet
-  `uncertain`.
+- une erreur synthétique indiquant qu'aucun effet n'a eu lieu pour une
+  réservation interrompue, ou demandant une inspection pour un effet
+  `unresolved`.
 
 Le transcript est écrit avant le record d'acquittement. Un second crash entre
 les deux ne duplique donc pas le résultat lors de la prochaine reprise.
@@ -151,7 +197,7 @@ La politique de reprise est volontairement conservatrice :
   arguments sont identiques ;
 - deux appels distincts avec les mêmes arguments restent deux effets
   légitimes ;
-- un effet `uncertain` reçoit un résultat synthétique et demande une
+- un effet `unresolved` reçoit un résultat synthétique et demande une
   inspection de l'état courant avant toute nouvelle mutation.
 
 La reprise ne constitue ni un rollback, ni une transaction du système de
