@@ -77,6 +77,12 @@ const NON_OVERFLOW_PATTERNS = [
 	/too many requests/i, // Generic HTTP 429 style
 ];
 
+function classifyOverflowText(text: string): boolean | undefined {
+	if (NON_OVERFLOW_PATTERNS.some((pattern) => pattern.test(text))) return false;
+	if (OVERFLOW_PATTERNS.some((pattern) => pattern.test(text))) return true;
+	return undefined;
+}
+
 /**
  * Check if an assistant message represents a context overflow error.
  *
@@ -133,11 +139,18 @@ const NON_OVERFLOW_PATTERNS = [
  */
 export function isContextOverflow(message: AssistantMessage, contextWindow?: number): boolean {
 	// Case 1: Check error message patterns
-	if (message.stopReason === "error" && message.errorMessage) {
-		// Skip messages matching known non-overflow patterns (e.g. throttling / rate-limit)
-		const isNonOverflow = NON_OVERFLOW_PATTERNS.some((p) => p.test(message.errorMessage!));
-		if (!isNonOverflow && OVERFLOW_PATTERNS.some((p) => p.test(message.errorMessage!))) {
-			return true;
+	if (message.stopReason === "error") {
+		const finalClassification = message.errorMessage ? classifyOverflowText(message.errorMessage) : undefined;
+		if (finalClassification !== undefined) return finalClassification;
+
+		// Provider wrappers may replace the actionable root cause with a generic
+		// terminal message. Consult only the latest diagnostic error so an older
+		// failed attempt cannot override the final failure classification.
+		for (let index = (message.diagnostics?.length ?? 0) - 1; index >= 0; index--) {
+			const error = message.diagnostics?.[index]?.error;
+			if (!error) continue;
+			const diagnosticText = `${error.code ?? ""} ${error.message}`;
+			return classifyOverflowText(diagnosticText) ?? false;
 		}
 	}
 

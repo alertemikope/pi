@@ -29,6 +29,7 @@ function createAssistant(
 	options: {
 		stopReason?: AssistantMessage["stopReason"];
 		errorMessage?: string;
+		diagnostics?: AssistantMessage["diagnostics"];
 		totalTokens?: number;
 		timestamp?: number;
 	},
@@ -44,6 +45,7 @@ function createAssistant(
 		provider: model.provider,
 		model: model.id,
 		usage: createUsage(options.totalTokens ?? 0),
+		diagnostics: options.diagnostics,
 	};
 }
 
@@ -405,6 +407,34 @@ describe("AgentSession compaction characterization", () => {
 		expect(compactionErrors).toContain(
 			"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
 		);
+	});
+
+	it("recovers overflow preserved only in the latest provider diagnostic", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const maskedOverflow = createAssistant(harness, {
+			stopReason: "error",
+			errorMessage: "Codex stream ended after output began and cannot be continued from its incomplete response.",
+			diagnostics: [
+				{
+					type: "provider_stream_failure",
+					timestamp: Date.now(),
+					error: {
+						name: "CodexApiError",
+						message: "Codex error: Your input exceeds the context window of this model.",
+						code: "context_length_exceeded",
+					},
+				},
+			],
+			timestamp: Date.now(),
+		});
+		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+
+		await sessionInternals._checkCompaction(maskedOverflow);
+
+		expect(runAutoCompactionSpy).toHaveBeenCalledOnce();
+		expect(runAutoCompactionSpy).toHaveBeenCalledWith("overflow", true);
 	});
 
 	it("compacts successful overflow responses without retrying", async () => {

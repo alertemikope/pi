@@ -102,6 +102,53 @@ describe("isContextOverflow", () => {
 		expect(isContextOverflow(message, 200000)).toBe(false);
 	});
 
+	it("detects overflow hidden by a generic provider wrapper error", () => {
+		const message = createErrorMessage(
+			"Codex stream ended after output began and cannot be continued from its incomplete response.",
+		);
+		message.diagnostics = [
+			{
+				type: "provider_stream_failure",
+				timestamp: Date.now(),
+				error: {
+					name: "CodexApiError",
+					message: "Codex error: Your input exceeds the context window of this model.",
+					code: "context_length_exceeded",
+				},
+			},
+		];
+		expect(isContextOverflow(message, 272000)).toBe(true);
+	});
+
+	it("does not let an older overflow diagnostic override the latest failure", () => {
+		const message = createErrorMessage("Provider request failed.");
+		message.diagnostics = [
+			{
+				type: "provider_stream_failure",
+				timestamp: Date.now() - 1,
+				error: { message: "context_length_exceeded" },
+			},
+			{
+				type: "provider_stream_failure",
+				timestamp: Date.now(),
+				error: { message: "Connection closed unexpectedly" },
+			},
+		];
+		expect(isContextOverflow(message, 272000)).toBe(false);
+	});
+
+	it("keeps an explicit final rate-limit error authoritative over diagnostics", () => {
+		const message = createErrorMessage("Rate limit exceeded, please retry later.");
+		message.diagnostics = [
+			{
+				type: "provider_stream_failure",
+				timestamp: Date.now(),
+				error: { message: "context_length_exceeded" },
+			},
+		];
+		expect(isContextOverflow(message, 272000)).toBe(false);
+	});
+
 	function createLengthStopMessage(options: {
 		input: number;
 		cacheRead: number;
