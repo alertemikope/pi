@@ -452,6 +452,7 @@ describe("AgentSession concurrent prompt guard", () => {
 					systemPrompt: string,
 					systemPromptOptions: BuildSystemPromptOptions,
 				) => Promise<undefined>;
+				getAllVerificationChecks: () => [];
 				invalidate: (message?: string) => void;
 			};
 		};
@@ -470,6 +471,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			},
 			emitInput: async () => ({ action: "continue" }),
 			emitBeforeAgentStart: async () => undefined,
+			getAllVerificationChecks: () => [],
 			invalidate: () => {},
 		};
 
@@ -597,6 +599,7 @@ describe("AgentSession concurrent prompt guard", () => {
 					systemPrompt: string,
 					systemPromptOptions: BuildSystemPromptOptions,
 				) => Promise<undefined>;
+				getAllVerificationChecks: () => [];
 				invalidate: (message?: string) => void;
 			};
 		};
@@ -611,6 +614,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			},
 			emitInput: async () => ({ action: "continue" }),
 			emitBeforeAgentStart: async () => undefined,
+			getAllVerificationChecks: () => [],
 			invalidate: () => {},
 		};
 

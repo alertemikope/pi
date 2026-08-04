@@ -92,7 +92,7 @@ export const IMAGE_MODELS = {
 				input: 0.3,
 				output: 2.5,
 				cacheRead: 0.03,
-				cacheWrite: 0.08333333333333334,
+				cacheWrite: 0.0833333333333333,
 			},
 		} satisfies ImagesModel<"openrouter-images">,
 		"google/gemini-3-pro-image": {
@@ -592,7 +592,7 @@ export const IMAGE_MODELS = {
 		} satisfies ImagesModel<"openrouter-images">,
 		"x-ai/grok-imagine-image-quality": {
 			id: "x-ai/grok-imagine-image-quality",
-			name: "xAI: Grok Imagine Image Quality",
+			name: "SpaceXAI: Grok Imagine Image Quality",
 			api: "openrouter-images",
 			provider: "openrouter",
 			baseUrl: "https://openrouter.ai/api/v1",
