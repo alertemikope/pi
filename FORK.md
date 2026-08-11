@@ -12,12 +12,15 @@ Le fork est maintenu sur :
 
 ## Portée exacte
 
-Cette implémentation n'est pas encore le Harness v2 complet décrit dans
-[`packages/agent/docs/harness-v2.md`](packages/agent/docs/harness-v2.md).
-Le fork intègre toutefois désormais le premier backend expérimental upstream :
-`SessionRepo`, le schéma des entrées et records, les lanes, le journal global,
-le backend mémoire et sa suite de conformité. Le runtime coding-agent reste
-temporairement adossé à son sidecar durable pendant la migration vers ce
+Upstream fournit désormais la surface stable Harness v2 et le modèle de session
+v4 décrits dans [`packages/agent/docs/harness.md`](packages/agent/docs/harness.md) :
+`AgentHarness`, `Session`, `SessionStorage`, `SessionRepo`, les lanes, le ledger
+d'usage et les backends mémoire, JSONL et SQLite. Les anciens exports et fichiers
+expérimentaux du fork ont donc été supprimés au profit de cette API stable.
+
+Le runtime du CLI coding-agent reste temporairement adossé à son transcript v3
+et au sidecar durable propre au fork. Cette couche ne remplace pas le Harness v2
+upstream : elle protège le runtime CLI actuel pendant sa migration vers le
 nouveau contrat.
 
 Le fork ajoute dès maintenant les propriétés suivantes au coding agent :
@@ -65,29 +68,27 @@ Le fork ajoute dès maintenant les propriétés suivantes au coding agent :
   rejouable et action de récupération (`wait`, `compact`, `reauthenticate`,
   `change_model`, etc.).
 
-Cette couche ne fournit pas encore les primitives complètes prévues par le
-design Harness v2 : `AgentHarness.create`, ordonnanceur de lanes, abonnements
-`watch`, stockage JSONL/SQLite v4 ou reprise exacte record-by-record de la
-génération du modèle.
+Cette couche sidecar ne route pas encore le CLI à travers `AgentHarness`, ses
+lanes, ses abonnements `watch` ou ses backends v4. Elle ne fournit pas non plus
+une reprise exacte record-by-record de la génération du modèle. Ces primitives
+existent désormais dans la surface upstream, mais la migration du CLI du fork
+reste à effectuer.
 
 ## Avancement des trois phases
 
 ### Phase 1 — durabilité
 
-Implémenté :
+Implémenté dans upstream : API stable de session v4, backends mémoire/JSONL,
+suite de conformité et ledger d'usage. Conservé dans le sidecar du fork :
 
-- backend mémoire et suite de conformité Harness v2 ;
-- `StepAttemptRecord.resultEntryId` et ledger `UsageRecord` alignés sur le
-  design final ;
 - séparation durable réservation/dispatch/settlement des outils ;
 - refus d'abandonner un effet externe non réconcilié ;
 - diagnostic durable du processus interrompu et tests `SIGKILL` réels pour les
   états sans effet, réservé et dispatché.
 
-Restant : le reaper et les contrats de capacités subagent/lane seront ajoutés
-avec le scheduler natif correspondant. Le runtime actuel ne possède pas encore
-de processus subagent ou de lane d'exécution auquel raccorder ce contrat ; une
-abstraction vide a volontairement été évitée.
+Restant : migrer les garanties du sidecar vers les transactions, opérations et
+lanes du Harness v2 stable, puis supprimer le sidecar lorsque le CLI utilise ce
+runtime de bout en bout.
 
 ### Phase 2 — fiabilité coding
 
@@ -110,8 +111,8 @@ lanes ; un snapshot Git n'est pas présenté comme un rollback atomique.
 
 ### Phase 3 — performance et observabilité
 
-Implémenté : ledger de coût Harness v2, taxonomie structurée des échecs avec
-actions de récupération, payload provider final stocké en CAS SHA-256,
+Implémenté : taxonomie structurée des échecs avec actions de récupération,
+payload provider final stocké en CAS SHA-256,
 comparaison byte-à-byte du préfixe commun, raisons d'invalidation explicites,
 journal de production séquencé et offsets consommateurs durables en
 compare-and-set. Ces métriques décrivent la forme de requête côté client ; elles

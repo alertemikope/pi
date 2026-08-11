@@ -2,9 +2,32 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added unbound single-line transcript scrolling actions, `tui.altScreen.lineUp` and `tui.altScreen.lineDown`, for fullscreen TUI keybindings ([#7830](https://github.com/earendil-works/pi/issues/7830)).
+- Added incremental primary-scroll-view search to the fullscreen TUI with configurable match styles, `Ctrl+Shift+F`, and next/previous navigation with `Enter`/`Ctrl+G` and `Shift+Enter`/`Ctrl+Shift+G`.
+
+### Changed
+
+- Reduced alternate-screen per-frame allocation churn roughly 9-18x by painting full-width layout rows as direct line references instead of recompositing every visible row through ANSI/grapheme segmentation on each frame.
+
+### Fixed
+
+- Fixed fullscreen transcript search snapping back to the current match during manual scrolling and fragmented SGR mouse input leaking into the search query.
+- Fixed required LaTeX arguments starting on a new line being parsed as empty ([#7760](https://github.com/earendil-works/pi/issues/7760)).
+
+## [0.84.1] - 2026-08-07
+
+### Added
+
+- Added unbound half-page transcript scrolling actions, `tui.altScreen.halfPageUp` and `tui.altScreen.halfPageDown`, for fullscreen TUI keybindings ([#7735](https://github.com/earendil-works/pi/issues/7735)).
+- Added double-click word and whitespace selection, granularity-aware drag selection, and triple-click paragraph selection in the fullscreen TUI ([#7725](https://github.com/earendil-works/pi/issues/7725), [#7733](https://github.com/earendil-works/pi/pull/7733) by [@volsa](https://github.com/volsa)).
+- Added an optional right-click paste handler to the alternate-screen TUI, currently enabled on Windows.
+
 ### Fixed
 
 - Fixed LaTeX relation, multiplication, and named-operator spacing, and correctly composed matrices with stacked fractions, operator limits, and adjacent matrices.
+- Reduced fullscreen mouse event volume under tmux, Zellij, and GNU Screen by using button-motion tracking instead of all-motion tracking.
 
 ## [0.84.0] - 2026-08-06
 
