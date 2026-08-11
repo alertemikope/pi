@@ -6,7 +6,11 @@ import { resolvePath } from "../utils/paths.ts";
 import { AgentSession } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
-import { acquireDurableOperationLease, type DurableOperationLease } from "./durable-operations.ts";
+import {
+	acquireDurableOperationLease,
+	type DurableOperationLease,
+	type DurableOperationStore,
+} from "./durable-operations.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
 import { convertToLlm } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
@@ -78,6 +82,11 @@ export interface CreateAgentSessionOptions {
 
 	/** Session manager. Default: SessionManager.create(cwd) */
 	sessionManager?: SessionManager;
+	/**
+	 * Alternate authoritative durable-operation backend for a persisted session.
+	 * Ownership transfers to the created AgentSession, including cleanup on failure.
+	 */
+	durableOperationStore?: DurableOperationStore;
 
 	/** Settings manager. Default: SettingsManager.create(cwd, agentDir) */
 	settingsManager?: SettingsManager;
@@ -181,11 +190,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const sessionFile = sessionManager.getSessionFile();
 	const sessionId = sessionManager.getSessionId();
 	const durableJournalPath = sessionFile ? `${sessionFile}.operations.jsonl` : undefined;
-	let durableLease: DurableOperationLease | undefined = durableJournalPath
-		? acquireDurableOperationLease(durableJournalPath)
-		: undefined;
+	let durableOperationStore = options.durableOperationStore;
+	let durableLease: DurableOperationLease | undefined;
 
 	try {
+		durableLease = durableJournalPath ? acquireDurableOperationLease(durableJournalPath) : undefined;
 		sessionManager.assertDurableSourceUnchanged();
 		if (sessionManager.getSessionFile() !== sessionFile) {
 			throw new Error(
@@ -393,6 +402,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			sessionManager.appendThinkingLevelChange(thinkingLevel);
 		}
 
+		if (durableOperationStore && durableOperationStore.sessionId !== sessionId) {
+			throw new Error(
+				`Durable operation store session mismatch: expected ${sessionId}, received ${durableOperationStore.sessionId}.`,
+			);
+		}
+		const durableOperations = durableOperationStore ? { store: durableOperationStore } : undefined;
 		const session = new AgentSession({
 			agent,
 			sessionManager,
@@ -408,8 +423,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			extensionRunnerRef,
 			sessionStartEvent: options.sessionStartEvent,
 			durableLease,
+			durableOperations,
 		});
 		durableLease = undefined;
+		durableOperationStore = undefined;
 		const extensionsResult = resourceLoader.getExtensions();
 
 		return {
@@ -419,6 +436,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 	} catch (error) {
 		durableLease?.release();
+		durableOperationStore?.close();
 		throw error;
 	}
 }

@@ -2,7 +2,12 @@ import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { acquireDurableOperationLease, DurableOperationJournal } from "../src/core/durable-operations.ts";
+import {
+	acquireDurableOperationLease,
+	DEFAULT_DURABLE_OPERATION_LANE,
+	DurableOperationJournal,
+	type DurableOperationStore,
+} from "../src/core/durable-operations.ts";
 import { runHostVerification } from "../src/core/verification.ts";
 
 function invocation(toolCallId: string, assistantEntryId = "assistant-1", toolIndex = 0) {
@@ -45,6 +50,8 @@ describe("DurableOperationJournal", () => {
 
 		const snapshot = journal.get(operation.id);
 		expect(snapshot).toMatchObject({
+			lane: "main",
+			kind: "run",
 			prompt: "Update the project",
 			status: "completed",
 			attempt: 1,
@@ -55,6 +62,44 @@ describe("DurableOperationJournal", () => {
 			toolName: "read",
 			replay: "safe",
 			status: "completed",
+		});
+	});
+
+	it("uses one authoritative operation per lane with Harness-compatible identities", () => {
+		const journal = createJournal();
+		const store: DurableOperationStore = journal;
+		const main = store.begin("Main operation");
+		const thread = store.begin("Thread operation", undefined, { lane: "thread:42", kind: "navigation" });
+
+		expect(main).toMatchObject({ lane: DEFAULT_DURABLE_OPERATION_LANE, kind: "run" });
+		expect(thread).toMatchObject({ lane: "thread:42", kind: "navigation" });
+		const openOperations = store.findOpenOperations();
+		expect(openOperations).toHaveLength(2);
+		expect(openOperations).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: thread.id, lane: "thread:42", kind: "navigation" }),
+				expect.objectContaining({ id: main.id, lane: "main", kind: "run" }),
+			]),
+		);
+		expect(store.findOpenOperations("main")).toMatchObject([{ id: main.id, lane: "main", kind: "run" }]);
+		expect(store.findOpenOperations("thread:42")).toMatchObject([
+			{ id: thread.id, lane: "thread:42", kind: "navigation" },
+		]);
+		expect(() => store.begin("Second thread operation", undefined, { lane: "thread:42" })).toThrow(
+			/on lane thread:42/,
+		);
+		expect(() => store.checkpoint({ id: thread.id, attempt: 1, recovered: false }, "legacy-main-handle")).toThrow(
+			/identity mismatch/,
+		);
+
+		const log = journal.getLog();
+		expect(log.find((record) => record.operationId === main.id)).toMatchObject({
+			lane: "main",
+			operationKind: "run",
+		});
+		expect(log.find((record) => record.operationId === thread.id)).toMatchObject({
+			lane: "thread:42",
+			operationKind: "navigation",
 		});
 	});
 
@@ -149,6 +194,15 @@ describe("DurableOperationJournal", () => {
 		});
 		journal.finish(firstOperation, "completed");
 
+		const threadOperation = journal.begin("First thread request", undefined, { lane: "thread:42" });
+		const firstThread = journal.recordProviderPayload(threadOperation, {
+			provider: "provider-a",
+			model: "model-a",
+			api: "openai-responses",
+			payload: { instructions: "stable", input: ["one"] },
+		});
+		journal.finish(threadOperation, "completed");
+
 		const secondOperation = journal.begin("Second request");
 		const second = journal.recordProviderPayload(secondOperation, {
 			provider: "provider-a",
@@ -177,6 +231,11 @@ describe("DurableOperationJournal", () => {
 		journal.finish(fourthOperation, "completed");
 
 		expect(first).toMatchObject({
+			invalidationReason: "first_request",
+			commonPrefixBytes: 0,
+			previousPayload: undefined,
+		});
+		expect(firstThread).toMatchObject({
 			invalidationReason: "first_request",
 			commonPrefixBytes: 0,
 			previousPayload: undefined,
@@ -276,6 +335,8 @@ describe("DurableOperationJournal", () => {
 		});
 		expect(restarted.resume().operation).toEqual({
 			id: operationId,
+			lane: "main",
+			kind: "run",
 			attempt: 1,
 			recovered: true,
 		});

@@ -712,6 +712,10 @@ export interface BeforeAgentStartEvent {
 
 export interface AgentOperationInfo {
 	id: string;
+	/** Harness-compatible lane identity. The classic CLI currently uses main. */
+	lane: string;
+	/** Durable operation category shared with the upstream Harness model. */
+	kind: "run" | "compaction" | "navigation";
 	attempt: number;
 	recovered: boolean;
 }

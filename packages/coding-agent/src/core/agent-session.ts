@@ -69,12 +69,15 @@ import {
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import {
 	acquireDurableOperationLease,
+	DEFAULT_DURABLE_OPERATION_LANE,
 	type DurableEffectClaim,
 	type DurableOperationHandle,
 	DurableOperationJournal,
 	type DurableOperationLease,
 	type DurableOperationSnapshot,
+	type DurableOperationStore,
 	durableValueFingerprint,
+	recoverDurableOperations,
 } from "./durable-operations.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
@@ -209,6 +212,16 @@ export type AgentSessionEvent =
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void | Promise<void>;
 
+function toAgentOperationInfo(operation: DurableOperationHandle): AgentOperationInfo {
+	return {
+		id: operation.id,
+		lane: operation.lane ?? DEFAULT_DURABLE_OPERATION_LANE,
+		kind: operation.kind ?? "run",
+		attempt: operation.attempt,
+		recovered: operation.recovered,
+	};
+}
+
 /**
  * Clone arbitrary observer payloads without ever falling back to the live value.
  *
@@ -320,6 +333,11 @@ export interface AgentSessionConfig {
 	sessionStartEvent?: SessionStartEvent;
 	/** Pre-acquired writer lease transferred by the SDK before session initialization writes. */
 	durableLease?: DurableOperationLease;
+	/**
+	 * Durable store supplied by an alternate composition root.
+	 * AgentSession becomes its sole owner and closes it on failure or disposal.
+	 */
+	durableOperations?: { store: DurableOperationStore };
 }
 
 export interface ExtensionBindings {
@@ -477,7 +495,8 @@ export class AgentSession {
 	private _baseSystemPrompt = "";
 	private _baseSystemPromptOptions!: BuildSystemPromptOptions;
 	private _systemPromptOverride?: string;
-	private readonly _durableOperations: DurableOperationJournal | undefined;
+	private readonly _durableOperations: DurableOperationStore | undefined;
+	private readonly _durableTranscriptLease: { release(): void } | undefined;
 	private _activeDurableOperation: DurableOperationHandle | undefined;
 	private _suspendedDurableOperation: DurableOperationSnapshot | undefined;
 	private readonly _durableEffectKeys = new Map<string, string>();
@@ -511,14 +530,33 @@ export class AgentSession {
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 		const sessionFile = this.sessionManager.getSessionFile();
-		if (sessionFile) {
-			const lease = config.durableLease ?? acquireDurableOperationLease(`${sessionFile}.operations.jsonl`);
-			const journal = new DurableOperationJournal(
-				`${sessionFile}.operations.jsonl`,
-				this.sessionManager.getSessionId(),
-				{ lease },
-			);
+		if (!sessionFile && (config.durableOperations || config.durableLease)) {
 			try {
+				config.durableOperations?.store.close();
+			} finally {
+				config.durableLease?.release();
+			}
+			throw new Error("Durable operation ownership requires a persisted transcript session.");
+		}
+		if (sessionFile) {
+			const journalPath = `${sessionFile}.operations.jsonl`;
+			const externalStore = config.durableOperations?.store;
+			let lease = config.durableLease;
+			let durableTranscriptLease: { release(): void } | undefined;
+			let store: DurableOperationStore | undefined;
+			try {
+				lease ??= acquireDurableOperationLease(journalPath);
+				durableTranscriptLease = externalStore ? lease.consume(journalPath) : undefined;
+				store =
+					externalStore ??
+					new DurableOperationJournal(journalPath, this.sessionManager.getSessionId(), {
+						lease,
+					});
+				if (store.sessionId !== this.sessionManager.getSessionId()) {
+					throw new Error(
+						`Durable operation store session mismatch: expected ${this.sessionManager.getSessionId()}, received ${store.sessionId}.`,
+					);
+				}
 				this.sessionManager.assertDurableSourceUnchanged();
 				this.sessionManager.ensurePersisted();
 				const physicalHeader = loadEntriesFromFile(sessionFile)[0];
@@ -532,16 +570,28 @@ export class AgentSession {
 					);
 				}
 			} catch (error) {
-				journal.close();
+				try {
+					(store ?? externalStore)?.close();
+				} finally {
+					durableTranscriptLease?.release();
+					lease?.release();
+				}
 				throw error;
 			}
-			this._durableOperations = journal;
+			if (!store) throw new Error("Durable operation store initialization failed.");
+			this._durableOperations = store;
+			this._durableTranscriptLease = durableTranscriptLease;
 		} else {
 			this._durableOperations = undefined;
+			this._durableTranscriptLease = undefined;
 		}
 
 		try {
-			this._suspendedDurableOperation = this._durableOperations?.recoverInFlight();
+			this._suspendedDurableOperation = this._durableOperations
+				? recoverDurableOperations(this._durableOperations).find(
+						(operation) => operation.lane === DEFAULT_DURABLE_OPERATION_LANE,
+					)
+				: undefined;
 
 			// Always subscribe to agent events for internal handling
 			// (session persistence, extensions, auto-compaction, retry logic)
@@ -555,7 +605,11 @@ export class AgentSession {
 				includeAllExtensionTools: true,
 			});
 		} catch (error) {
-			this._durableOperations?.close();
+			try {
+				this._durableOperations?.close();
+			} finally {
+				this._durableTranscriptLease?.release();
+			}
 			throw error;
 		}
 	}
@@ -1033,7 +1087,7 @@ export class AgentSession {
 			this._turnIndex = 0;
 			await this._extensionRunner.emit({
 				type: "agent_start",
-				operation: this._activeDurableOperation ? { ...this._activeDurableOperation } : undefined,
+				operation: this._activeDurableOperation ? toAgentOperationInfo(this._activeDurableOperation) : undefined,
 			});
 		} else if (event.type === "agent_end") {
 			await this._extensionRunner.emit({ type: "agent_end", messages: event.messages });
@@ -1174,7 +1228,11 @@ export class AgentSession {
 			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
 		);
 		this._disconnectFromAgent();
-		this._durableOperations?.close();
+		try {
+			this._durableOperations?.close();
+		} finally {
+			this._durableTranscriptLease?.release();
+		}
 		this._eventListeners = [];
 		cleanupSessionResources(this.sessionId);
 	}
@@ -1492,7 +1550,7 @@ export class AgentSession {
 				this._systemPromptOverride = undefined;
 				this._flushPendingBashMessages();
 				await this._emitAgentSettled({
-					operation: durableOperation ? { ...durableOperation } : undefined,
+					operation: durableOperation ? toAgentOperationInfo(durableOperation) : undefined,
 					outcome: operationSuspended ? "suspended" : outcome,
 					error: operationError,
 				});

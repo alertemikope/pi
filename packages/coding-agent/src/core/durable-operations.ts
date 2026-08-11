@@ -22,8 +22,10 @@ import { isVerificationReceipt, type VerificationReceipt } from "./verification.
 
 export type DurableOperationStatus = "accepted" | "running" | "suspended" | "completed" | "failed" | "aborted";
 export type DurableOperationOutcome = Extract<DurableOperationStatus, "completed" | "failed" | "aborted">;
+export type DurableOperationKind = "run" | "compaction" | "navigation";
 export type DurableReplayPolicy = "safe" | "never";
 export type DurableEffectStatus = "reserved" | "dispatched" | "completed" | "failed" | "unresolved";
+export const DEFAULT_DURABLE_OPERATION_LANE = "main";
 
 export type ProviderPayloadInvalidationReason =
 	| "first_request"
@@ -52,6 +54,8 @@ export interface DurableJournalRecord {
 	at: number;
 	operationId: string;
 	sessionId: string;
+	lane: string;
+	operationKind: DurableOperationKind;
 	type: string;
 	data: unknown;
 }
@@ -72,6 +76,10 @@ export interface DurableProcessExitDiagnostic {
 
 export interface DurableOperationHandle {
 	id: string;
+	/** Defaults to main when omitted by legacy callers. */
+	lane?: string;
+	/** Defaults to run when omitted by legacy callers. */
+	kind?: DurableOperationKind;
 	attempt: number;
 	recovered: boolean;
 }
@@ -96,9 +104,16 @@ export interface DurablePreparedInput {
 	systemPrompt?: string;
 }
 
+export interface DurableOperationBeginOptions {
+	lane?: string;
+	kind?: DurableOperationKind;
+}
+
 export interface DurableOperationSnapshot {
 	id: string;
 	sessionId: string;
+	lane: string;
+	kind: DurableOperationKind;
 	prompt: string;
 	status: DurableOperationStatus;
 	attempt: number;
@@ -115,6 +130,75 @@ export interface DurableOperationSnapshot {
 	error?: string;
 }
 
+/**
+ * Runtime-owned durable operation boundary.
+ *
+ * AgentSession depends on this contract rather than the JSONL sidecar class.
+ * One implementation is authoritative for a session; adapters must not mirror
+ * transitions into a second operation store. Implementations must make close
+ * idempotent because ownership can be released along constructor error paths.
+ */
+export interface DurableOperationStore {
+	readonly sessionId: string;
+	close(): void;
+	recoverInFlight(lane?: string): DurableOperationSnapshot | undefined;
+	begin(
+		prompt: string,
+		prepared?: DurablePreparedInput,
+		options?: DurableOperationBeginOptions,
+	): DurableOperationHandle;
+	updatePrepared(operation: DurableOperationHandle, prepared: DurablePreparedInput): void;
+	resume(lane?: string): { operation: DurableOperationHandle; prompt: string };
+	abortSuspended(reason?: string, lane?: string): DurableOperationSnapshot;
+	checkpoint(operation: DurableOperationHandle, kind: string, data?: unknown): void;
+	suspend(operation: DurableOperationHandle, error: string): DurableOperationSnapshot;
+	reserveEffect(
+		operation: DurableOperationHandle,
+		input: {
+			assistantEntryId: string;
+			toolIndex: number;
+			toolCallId: string;
+			toolName: string;
+		},
+	): { key: string; resultEntryId: string };
+	dispatchEffect(
+		operation: DurableOperationHandle,
+		key: string,
+		input: { args: unknown; replay: DurableReplayPolicy },
+	): DurableEffectClaim;
+	finishEffect(
+		operation: DurableOperationHandle,
+		key: string,
+		status: "completed" | "failed",
+		result?: unknown,
+		error?: string,
+	): void;
+	recordVerification(operation: DurableOperationHandle, receipt: VerificationReceipt): void;
+	recordProviderPayload(
+		operation: DurableOperationHandle,
+		input: { provider: string; model: string; api: string; payload: unknown },
+	): ProviderPayloadDiagnostic;
+	markEffectReconciled(operationId: string, key: string): void;
+	finish(operation: DurableOperationHandle, outcome: DurableOperationOutcome, error?: string): void;
+	latestSuspended(lane?: string): DurableOperationSnapshot | undefined;
+	/** Returns every open operation when lane is omitted. */
+	findOpenOperations(lane?: string): DurableOperationSnapshot[];
+}
+
+/**
+ * Convert every interrupted lane into an explicit suspended state before a
+ * runtime starts accepting new work. This keeps uncertain effects visible even
+ * when the classic CLI only drives the main lane.
+ */
+export function recoverDurableOperations(store: DurableOperationStore): DurableOperationSnapshot[] {
+	const recovered: DurableOperationSnapshot[] = [];
+	for (const operation of store.findOpenOperations()) {
+		const snapshot = store.recoverInFlight(operation.lane);
+		if (snapshot) recovered.push(snapshot);
+	}
+	return recovered;
+}
+
 interface DurableRecordBase {
 	schema: 1;
 	seq: number;
@@ -127,6 +211,10 @@ type DurableRecord =
 	| (DurableRecordBase & {
 			type: "operation_started";
 			prompt: string;
+			/** Missing on legacy schema-1 records; defaults to main. */
+			lane?: string;
+			/** Missing on legacy schema-1 records; defaults to run. */
+			operationKind?: DurableOperationKind;
 			prepared?: DurablePreparedInput;
 			process?: DurableProcessIdentity;
 	  })
@@ -502,6 +590,28 @@ function isOptionalString(value: unknown): boolean {
 	return value === undefined || typeof value === "string";
 }
 
+function isDurableOperationLane(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		value.length <= 256 &&
+		!value.includes("\0") &&
+		!value.includes("\r") &&
+		!value.includes("\n")
+	);
+}
+
+function resolveDurableOperationLane(lane = DEFAULT_DURABLE_OPERATION_LANE): string {
+	if (!isDurableOperationLane(lane)) {
+		throw new Error("Durable operation lane must be 1-256 characters without NUL or newlines.");
+	}
+	return lane;
+}
+
+function isDurableOperationKind(value: unknown): value is DurableOperationKind {
+	return value === "run" || value === "compaction" || value === "navigation";
+}
+
 function hasRecordEnvelope(record: Record<string, unknown>): boolean {
 	return (
 		record.schema === 1 &&
@@ -593,6 +703,8 @@ function isDurableRecord(value: unknown): value is DurableRecord {
 	switch (record.type) {
 		case "operation_started": {
 			if (typeof record.prompt !== "string") return false;
+			if (record.lane !== undefined && !isDurableOperationLane(record.lane)) return false;
+			if (record.operationKind !== undefined && !isDurableOperationKind(record.operationKind)) return false;
 			if (record.process !== undefined && !isDurableProcessIdentity(record.process)) return false;
 			if (record.prepared === undefined) return true;
 			if (!record.prepared || typeof record.prepared !== "object") return false;
@@ -703,7 +815,7 @@ function isDurableRecord(value: unknown): value is DurableRecord {
  * Upstream session files remain readable, while interrupted operations and
  * tool effects can be reduced independently.
  */
-export class DurableOperationJournal {
+export class DurableOperationJournal implements DurableOperationStore {
 	readonly path: string;
 	readonly sessionId: string;
 	private readonly lease: { release(): void } | undefined;
@@ -742,8 +854,8 @@ export class DurableOperationJournal {
 		this.lease?.release();
 	}
 
-	recoverInFlight(): DurableOperationSnapshot | undefined {
-		const operation = this.latestOpen();
+	recoverInFlight(lane = DEFAULT_DURABLE_OPERATION_LANE): DurableOperationSnapshot | undefined {
+		const operation = this.latestOpen(resolveDurableOperationLane(lane));
 		if (!operation || operation.status === "suspended") {
 			return operation;
 		}
@@ -778,11 +890,20 @@ export class DurableOperationJournal {
 		return this.get(operation.id);
 	}
 
-	begin(prompt: string, prepared?: DurablePreparedInput): DurableOperationHandle {
-		const open = this.latestOpen();
+	begin(
+		prompt: string,
+		prepared?: DurablePreparedInput,
+		options: DurableOperationBeginOptions = {},
+	): DurableOperationHandle {
+		const lane = resolveDurableOperationLane(options.lane);
+		const kind = options.kind ?? "run";
+		if (!isDurableOperationKind(kind)) {
+			throw new Error(`Unsupported durable operation kind: ${String(kind)}`);
+		}
+		const open = this.latestOpen(lane);
 		if (open) {
 			throw new Error(
-				`Operation ${open.id} is ${open.status}. Run /recover to continue it or /recover abort to discard it.`,
+				`Operation ${open.id} on lane ${lane} is ${open.status}. Run /recover to continue it or /recover abort to discard it.`,
 			);
 		}
 
@@ -792,6 +913,8 @@ export class DurableOperationJournal {
 			operationId,
 			sessionId: this.sessionId,
 			prompt,
+			lane,
+			operationKind: kind,
 			process: this.processIdentity,
 			prepared: prepared
 				? {
@@ -807,11 +930,11 @@ export class DurableOperationJournal {
 			attempt: 1,
 			recovered: false,
 		});
-		return { id: operationId, attempt: 1, recovered: false };
+		return { id: operationId, lane, kind, attempt: 1, recovered: false };
 	}
 
 	updatePrepared(operation: DurableOperationHandle, prepared: DurablePreparedInput): void {
-		this.requireOpen(operation.id);
+		this.requireHandle(operation);
 		this.append({
 			type: "prepared_updated",
 			operationId: operation.id,
@@ -823,8 +946,8 @@ export class DurableOperationJournal {
 		});
 	}
 
-	resume(): { operation: DurableOperationHandle; prompt: string } {
-		const suspended = this.latestSuspended();
+	resume(lane = DEFAULT_DURABLE_OPERATION_LANE): { operation: DurableOperationHandle; prompt: string } {
+		const suspended = this.latestSuspended(resolveDurableOperationLane(lane));
 		if (!suspended) {
 			throw new Error("No suspended operation is available for this session.");
 		}
@@ -840,21 +963,38 @@ export class DurableOperationJournal {
 			recovered: true,
 		});
 		return {
-			operation: { id: suspended.id, attempt, recovered: true },
+			operation: {
+				id: suspended.id,
+				lane: suspended.lane,
+				kind: suspended.kind,
+				attempt,
+				recovered: true,
+			},
 			prompt: suspended.prompt,
 		};
 	}
 
-	abortSuspended(reason = "discarded by operator"): DurableOperationSnapshot {
-		const suspended = this.latestSuspended();
+	abortSuspended(reason = "discarded by operator", lane = DEFAULT_DURABLE_OPERATION_LANE): DurableOperationSnapshot {
+		const suspended = this.latestSuspended(resolveDurableOperationLane(lane));
 		if (!suspended) {
 			throw new Error("No suspended operation is available for this session.");
 		}
-		this.finish({ id: suspended.id, attempt: suspended.attempt, recovered: true }, "aborted", reason);
+		this.finish(
+			{
+				id: suspended.id,
+				lane: suspended.lane,
+				kind: suspended.kind,
+				attempt: suspended.attempt,
+				recovered: true,
+			},
+			"aborted",
+			reason,
+		);
 		return this.get(suspended.id)!;
 	}
 
 	checkpoint(operation: DurableOperationHandle, kind: string, data?: unknown): void {
+		this.requireHandle(operation);
 		this.append({
 			type: "checkpoint",
 			operationId: operation.id,
@@ -865,7 +1005,7 @@ export class DurableOperationJournal {
 	}
 
 	suspend(operation: DurableOperationHandle, error: string): DurableOperationSnapshot {
-		this.requireOpen(operation.id);
+		this.requireHandle(operation);
 		this.append({
 			type: "operation_suspended",
 			operationId: operation.id,
@@ -899,7 +1039,7 @@ export class DurableOperationJournal {
 			toolName: string;
 		},
 	): { key: string; resultEntryId: string } {
-		const snapshot = this.requireOpen(operation.id);
+		const snapshot = this.requireHandle(operation);
 		const key = `effect:${hash(`${operation.id}\0${input.assistantEntryId}\0${input.toolIndex}`)}`;
 		const exact = snapshot.effects.find((effect) => effect.key === key);
 		if (exact) {
@@ -934,7 +1074,7 @@ export class DurableOperationJournal {
 		key: string,
 		input: { args: unknown; replay: DurableReplayPolicy },
 	): DurableEffectClaim {
-		const snapshot = this.requireOpen(operation.id);
+		const snapshot = this.requireHandle(operation);
 		const argsJson = canonicalJson(input.args);
 		const argsHash = hash(argsJson);
 		const exact = snapshot.effects.find((effect) => effect.key === key);
@@ -978,7 +1118,7 @@ export class DurableOperationJournal {
 		result?: unknown,
 		error?: string,
 	): void {
-		this.requireOpen(operation.id);
+		this.requireHandle(operation);
 		this.append({
 			type: "tool_settled",
 			operationId: operation.id,
@@ -991,7 +1131,7 @@ export class DurableOperationJournal {
 	}
 
 	recordVerification(operation: DurableOperationHandle, receipt: VerificationReceipt): void {
-		this.requireOpen(operation.id);
+		this.requireHandle(operation);
 		if (receipt.operationId !== operation.id || receipt.sessionId !== this.sessionId) {
 			throw new Error(`Verification receipt ${receipt.id} does not belong to durable operation ${operation.id}`);
 		}
@@ -1007,7 +1147,7 @@ export class DurableOperationJournal {
 		operation: DurableOperationHandle,
 		input: { provider: string; model: string; api: string; payload: unknown },
 	): ProviderPayloadDiagnostic {
-		this.requireOpen(operation.id);
+		const operationSnapshot = this.requireHandle(operation);
 		let serialized: string | undefined;
 		try {
 			serialized = JSON.stringify(input.payload);
@@ -1021,7 +1161,11 @@ export class DurableOperationJournal {
 		const previousRecord = this.records
 			.slice()
 			.reverse()
-			.find((record) => record.type === "provider_payload_recorded");
+			.find(
+				(record) =>
+					record.type === "provider_payload_recorded" &&
+					this.operations.get(record.operationId)?.lane === operationSnapshot.lane,
+			);
 		const previous = previousRecord?.type === "provider_payload_recorded" ? previousRecord.diagnostic : undefined;
 		let prefixBytes = 0;
 		let invalidationReason: ProviderPayloadInvalidationReason = "first_request";
@@ -1084,13 +1228,7 @@ export class DurableOperationJournal {
 	}
 
 	finish(operation: DurableOperationHandle, outcome: DurableOperationOutcome, error?: string): void {
-		const current = this.get(operation.id);
-		if (!current) {
-			throw new Error(`Unknown durable operation: ${operation.id}`);
-		}
-		if (current.status === "completed" || current.status === "failed" || current.status === "aborted") {
-			throw new Error(`Durable operation ${operation.id} already finished with ${current.status}`);
-		}
+		const current = this.requireHandle(operation);
 		if (
 			current.effects.some(
 				(effect) =>
@@ -1109,9 +1247,20 @@ export class DurableOperationJournal {
 		});
 	}
 
-	latestSuspended(): DurableOperationSnapshot | undefined {
-		const open = this.latestOpen();
+	latestSuspended(lane = DEFAULT_DURABLE_OPERATION_LANE): DurableOperationSnapshot | undefined {
+		const open = this.latestOpen(resolveDurableOperationLane(lane));
 		return open?.status === "suspended" ? open : undefined;
+	}
+
+	findOpenOperations(lane?: string): DurableOperationSnapshot[] {
+		const resolvedLane = lane === undefined ? undefined : resolveDurableOperationLane(lane);
+		return this.reduce()
+			.filter(
+				(operation) =>
+					(resolvedLane === undefined || operation.lane === resolvedLane) &&
+					(operation.status === "accepted" || operation.status === "running" || operation.status === "suspended"),
+			)
+			.sort((left, right) => right.updatedAt - left.updatedAt);
 	}
 
 	get(operationId: string): DurableOperationSnapshot | undefined {
@@ -1133,8 +1282,19 @@ export class DurableOperationJournal {
 		const items: DurableJournalRecord[] = [];
 		for (const record of this.records) {
 			if (options.afterSeq !== undefined && record.seq <= options.afterSeq) continue;
+			const operation = this.operations.get(record.operationId);
+			if (!operation) throw new Error(`Durable journal record references unknown operation ${record.operationId}`);
 			const { schema: _schema, seq, at, operationId, sessionId, type, ...data } = record;
-			items.push({ seq, at, operationId, sessionId, type, data: cloneJson(data) });
+			items.push({
+				seq,
+				at,
+				operationId,
+				sessionId,
+				lane: operation.lane,
+				operationKind: operation.kind,
+				type,
+				data: cloneJson(data),
+			});
 			if (items.length === options.limit) break;
 		}
 		return items;
@@ -1198,14 +1358,8 @@ export class DurableOperationJournal {
 		);
 	}
 
-	private latestOpen(): DurableOperationSnapshot | undefined {
-		return this.reduce()
-			.slice()
-			.reverse()
-			.find(
-				(operation) =>
-					operation.status === "accepted" || operation.status === "running" || operation.status === "suspended",
-			);
+	private latestOpen(lane: string): DurableOperationSnapshot | undefined {
+		return this.findOpenOperations(lane)[0];
 	}
 
 	private requireOpen(operationId: string): DurableOperationSnapshot {
@@ -1217,6 +1371,17 @@ export class DurableOperationJournal {
 			throw new Error(`Durable operation ${operationId} already finished with ${operation.status}`);
 		}
 		return operation;
+	}
+
+	private requireHandle(operation: DurableOperationHandle): DurableOperationSnapshot {
+		const snapshot = this.requireOpen(operation.id);
+		if (
+			snapshot.lane !== (operation.lane ?? DEFAULT_DURABLE_OPERATION_LANE) ||
+			snapshot.kind !== (operation.kind ?? "run")
+		) {
+			throw new Error(`Durable operation identity mismatch for ${operation.id}`);
+		}
+		return snapshot;
 	}
 
 	private validateConsumerId(consumerId: string): void {
@@ -1366,12 +1531,16 @@ export class DurableOperationJournal {
 			if (this.operations.has(record.operationId)) {
 				throw new Error(`Duplicate durable operation ${record.operationId}`);
 			}
+			const lane = resolveDurableOperationLane(record.lane);
 			const existingOpen = [...this.operations.values()].find(
 				(operation) =>
-					operation.status === "accepted" || operation.status === "running" || operation.status === "suspended",
+					operation.lane === lane &&
+					(operation.status === "accepted" || operation.status === "running" || operation.status === "suspended"),
 			);
 			if (existingOpen) {
-				throw new Error(`Cannot start a durable operation while ${existingOpen.id} is ${existingOpen.status}`);
+				throw new Error(
+					`Cannot start a durable operation on lane ${lane} while ${existingOpen.id} is ${existingOpen.status}`,
+				);
 			}
 			return;
 		}
@@ -1536,7 +1705,11 @@ export class DurableOperationJournal {
 			const previousRecord = this.records
 				.slice()
 				.reverse()
-				.find((candidate) => candidate.type === "provider_payload_recorded");
+				.find(
+					(candidate) =>
+						candidate.type === "provider_payload_recorded" &&
+						this.operations.get(candidate.operationId)?.lane === operation.lane,
+				);
 			const previous = previousRecord?.type === "provider_payload_recorded" ? previousRecord.diagnostic : undefined;
 			const diagnostic = record.diagnostic;
 			const requiredLaneReason: ProviderPayloadInvalidationReason = !previous
@@ -1629,6 +1802,8 @@ export class DurableOperationJournal {
 			this.operations.set(record.operationId, {
 				id: record.operationId,
 				sessionId: record.sessionId,
+				lane: record.lane ?? DEFAULT_DURABLE_OPERATION_LANE,
+				kind: record.operationKind ?? "run",
 				prompt: record.prompt,
 				status: "accepted",
 				attempt: 0,

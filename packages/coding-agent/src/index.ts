@@ -55,16 +55,20 @@ export {
 } from "./core/content-addressed-store.ts";
 export {
 	acquireDurableOperationLease,
+	DEFAULT_DURABLE_OPERATION_LANE,
 	type DurableEffectClaim,
 	type DurableEffectSnapshot,
 	type DurableEffectStatus,
 	type DurableJournalRecord,
+	type DurableOperationBeginOptions,
 	type DurableOperationHandle,
 	DurableOperationJournal,
+	type DurableOperationKind,
 	type DurableOperationLease,
 	type DurableOperationOutcome,
 	type DurableOperationSnapshot,
 	type DurableOperationStatus,
+	type DurableOperationStore,
 	type DurablePreparedInput,
 	type DurableProcessExitDiagnostic,
 	type DurableProcessIdentity,
@@ -72,6 +76,7 @@ export {
 	getDurableOperationArtifactPaths,
 	type ProviderPayloadDiagnostic,
 	type ProviderPayloadInvalidationReason,
+	recoverDurableOperations,
 } from "./core/durable-operations.ts";
 export { createEventBus, type EventBus, type EventBusController } from "./core/event-bus.ts";
 // Extension system

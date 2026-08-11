@@ -23,6 +23,14 @@ et au sidecar durable propre au fork. Cette couche ne remplace pas le Harness v2
 upstream : elle protège le runtime CLI actuel pendant sa migration vers le
 nouveau contrat.
 
+`AgentSession` dépend désormais du contrat lane-aware `DurableOperationStore`,
+et non plus directement de la classe JSONL. Le sidecar reste l'unique autorité
+par défaut ; un point de composition peut injecter un autre adaptateur de
+stockage, sans miroir ni double écriture. Le verrou exclusif du transcript reste
+obligatoire et toutes les lanes interrompues sont suspendues avant la reprise du
+runtime. Le CLI classique ne pilote encore que `main`. Les anciens journaux sans
+lane ni type d'opération sont lus comme `main` / `run`.
+
 Le fork ajoute dès maintenant les propriétés suivantes au coding agent :
 
 - une opération durable par requête utilisateur dans chaque session
@@ -81,6 +89,8 @@ reste à effectuer.
 Implémenté dans upstream : API stable de session v4, backends mémoire/JSONL,
 suite de conformité et ledger d'usage. Conservé dans le sidecar du fork :
 
+- contrat `DurableOperationStore` avec identités `lane` / `kind` compatibles
+  avec le modèle Harness et une seule opération ouverte par lane ;
 - séparation durable réservation/dispatch/settlement des outils ;
 - refus d'abandonner un effet externe non réconcilié ;
 - diagnostic durable du processus interrompu et tests `SIGKILL` réels pour les

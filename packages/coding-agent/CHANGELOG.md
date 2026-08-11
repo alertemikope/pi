@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added a lane-aware `DurableOperationStore` boundary so the active sidecar remains the sole operation authority while alternate storage adapters can be injected without rewriting `AgentSession`, retaining transcript writer exclusion and suspending interrupted work on every lane before startup.
 - Added durable host verification gates with one hidden corrective continuation, operation identities on extension lifecycle events, and host-attested reruns before settlement.
 - Added explicit durable journal sequences, compare-and-set consumer offsets, process-exit diagnostics, and a real `SIGKILL` crash matrix.
 - Added private SHA-256 CAS storage and final provider-payload prefix diagnostics after extension transformations.

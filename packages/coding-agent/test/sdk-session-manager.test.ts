@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { DurableOperationJournal } from "../src/core/durable-operations.ts";
+import { acquireDurableOperationLease, DurableOperationJournal } from "../src/core/durable-operations.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 
@@ -63,6 +63,82 @@ describe("createAgentSession session manager defaults", () => {
 		expect(session.sessionManager.isPersisted()).toBe(false);
 
 		session.dispose();
+	});
+
+	it("uses an injected durable operation store as the sole operation authority", async () => {
+		const model = getModel("anthropic", "claude-sonnet-4-5");
+		expect(model).toBeTruthy();
+
+		const sessionManager = SessionManager.create(cwd, join(tempDir, "sessions"));
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session path");
+		const customJournalPath = join(tempDir, "custom-operation-store.jsonl");
+		const store = new DurableOperationJournal(customJournalPath, sessionManager.getSessionId());
+		store.begin("Recover through the injected store");
+		const thread = store.begin("Recover a second lane", undefined, { lane: "thread:42" });
+		store.claimEffect(thread, {
+			assistantEntryId: "assistant-thread",
+			toolIndex: 0,
+			toolCallId: "call-thread",
+			toolName: "bash",
+			args: { command: "deploy" },
+			replay: "never",
+		});
+
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir,
+			model: model!,
+			sessionManager,
+			durableOperationStore: store,
+		});
+
+		expect(session.getSuspendedOperation()).toMatchObject({
+			lane: "main",
+			kind: "run",
+			status: "suspended",
+		});
+		expect(existsSync(customJournalPath)).toBe(true);
+		expect(existsSync(`${sessionFile}.operations.jsonl`)).toBe(false);
+		expect(store.get(thread.id)).toMatchObject({
+			lane: "thread:42",
+			status: "suspended",
+			effects: [{ status: "unresolved" }],
+		});
+		expect(() => acquireDurableOperationLease(`${sessionFile}.operations.jsonl`)).toThrow(/already open/);
+
+		session.dispose();
+		const releasedLease = acquireDurableOperationLease(`${sessionFile}.operations.jsonl`);
+		releasedLease.release();
+	});
+
+	it("closes an injected store when the transcript writer lease is unavailable", async () => {
+		const model = getModel("anthropic", "claude-sonnet-4-5");
+		expect(model).toBeTruthy();
+
+		const sessionManager = SessionManager.create(cwd, join(tempDir, "sessions"));
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session path");
+		const blockingLease = acquireDurableOperationLease(`${sessionFile}.operations.jsonl`);
+		const store = new DurableOperationJournal(
+			join(tempDir, "rejected-custom-operation-store.jsonl"),
+			sessionManager.getSessionId(),
+		);
+
+		try {
+			await expect(
+				createAgentSession({
+					cwd,
+					agentDir,
+					model: model!,
+					sessionManager,
+					durableOperationStore: store,
+				}),
+			).rejects.toThrow(/already open/);
+			expect(() => store.begin("Must not run")).toThrow(/closed/);
+		} finally {
+			blockingLease.release();
+		}
 	});
 
 	it("releases the pre-acquired lease when the session path changes during initialization", async () => {
